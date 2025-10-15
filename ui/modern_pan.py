@@ -246,6 +246,9 @@ class FileManagerUI(QMainWindow):
         # 初始化API客户端
         self.api_client = APIClient()
         
+        # 初始化更新检测管理器
+        self.init_update_manager()
+        
         # 公共资源模式与分页
         self.in_public = False
         self.public_page = 1
@@ -877,7 +880,12 @@ class FileManagerUI(QMainWindow):
 
     def _check_version_from_tray(self):
         """从系统托盘触发的版本检查"""
-        QMessageBox.information(self, '版本检查', '版本检查功能已移除业务逻辑，仅保留界面。')
+        from core.update_manager import get_global_update_manager
+        update_manager = get_global_update_manager()
+        if update_manager:
+            update_manager.manual_check()
+        else:
+            QMessageBox.warning(self, '检查更新', '更新检测器未初始化')
 
     def closeEvent(self, event):
         """重写关闭事件"""
@@ -1747,6 +1755,13 @@ class FileManagerUI(QMainWindow):
             act_download = menu.addAction("下载")
             act_share = menu.addAction("分享")
             act_report = menu.addAction("举报")
+            
+            # 添加分隔线
+            menu.addSeparator()
+            
+            # 添加关于选项（放在最后）
+            act_about = menu.addAction("关于")
+            
             global_pos = self.file_tree.viewport().mapToGlobal(position)
             action = menu.exec(global_pos)
             if action is None:
@@ -1760,6 +1775,8 @@ class FileManagerUI(QMainWindow):
                 self.on_public_cell_clicked(model.index(row, 6))
             elif action == act_report:
                 self.on_public_cell_clicked(model.index(row, 7))
+            elif action == act_about:
+                self.show_about()
         except Exception as e:
             try:
                 QMessageBox.warning(self, "菜单", f"操作失败：{e}")
@@ -1804,11 +1821,48 @@ class FileManagerUI(QMainWindow):
             size_bytes /= 1024
         return f"{size_bytes:.2f} TB"
 
+    def init_update_manager(self):
+        """初始化更新检测管理器"""
+        try:
+            from core.update_manager import init_update_manager
+            
+            # 初始化更新管理器
+            self.update_manager = init_update_manager(
+                parent=self,
+                api_base_url="http://118.24.67.10",  # 使用您的实际API地址
+                current_version="1.0.1",
+                platform="desktop"
+            )
+            
+            # 连接信号
+            self.update_manager.update_available.connect(self.on_update_available)
+            self.update_manager.check_error.connect(self.on_update_check_error)
+            
+            # 启动自动检查
+            self.update_manager.start_auto_check(30 * 60 * 1000)  # 30分钟检查一次
+            
+            print("[DEBUG] 更新检测管理器初始化成功")
+            
+        except Exception as e:
+            print(f"[DEBUG] 更新检测管理器初始化失败: {e}")
+            self.update_manager = None
+
+    def on_update_available(self, result):
+        """处理更新可用信号"""
+        print(f"[DEBUG] 发现更新: {result.get('message', '')}")
+        # 更新管理器会自动显示更新对话框，这里可以添加额外的处理逻辑
+        
+    def on_update_check_error(self, error):
+        """处理更新检查错误信号"""
+        print(f"[DEBUG] 更新检查错误: {error}")
+        # 可以在这里添加错误处理逻辑，比如显示状态栏消息等
+
     def show_about(self):
         """显示关于信息"""
         about_text = (
             "云栈-您身边的共享资料库 V1.0.1\n\n"
-            "这是一个简化版的界面演示程序，已移除所有业务逻辑。\n"
+            "支持多账号管理、文件分享、下载、上传、举报等功能。\n"
+            "微信：LOOKHX\n"
             "© 2023 云栈团队 保留所有权利。"
         )
         QMessageBox.about(self, "关于云栈", about_text)
