@@ -28,7 +28,14 @@ class AuthThread(QThread):
         poll_interval = 5
         
         while self.running and attempts < max_attempts:
-            result = self.api_client.poll_auth_status(self.device_code)
+            try:
+                result = self.api_client.poll_auth_status(self.device_code)
+            except Exception as e:
+                print(f"轮询网络错误: {e}")
+                # 网络错误时继续轮询，不中断
+                self.msleep(poll_interval * 1000)
+                attempts += 1
+                continue
             
             if result:
                 if result.get("status") == "ok":
@@ -66,15 +73,23 @@ class AutoAuthThread(QThread):
     
     def run(self):
         """轮询授权状态"""
+        self.running = True  # 确保running状态正确初始化
         max_attempts = 120  # 10分钟
         attempts = 0
         poll_interval = 5  # 遵循设备授权最小间隔建议
         
         while self.running and attempts < max_attempts:
-            result = self.api_client.poll_auto_auth_status(
-                self.device_code, 
-                self.api_client.device_fingerprint
-            )
+            try:
+                result = self.api_client.poll_auto_auth_status(
+                    self.device_code, 
+                    self.api_client.device_fingerprint
+                )
+            except Exception as e:
+                print(f"轮询网络错误: {e}")
+                # 网络错误时继续轮询，不中断
+                self.msleep(poll_interval * 1000)
+                attempts += 1
+                continue
             
             if result:
                 if (result.get("status") or "").lower() in ("success", "ok"):

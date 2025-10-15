@@ -55,8 +55,8 @@ class ShareDialog(QDialog):
         layout.addLayout(form)
         # 按钮
         btns = QHBoxLayout()
-        ok = QPushButton("确定")
-        cancel = QPushButton("取消")
+        ok = MaterialButton("确定")
+        cancel = MaterialButton("取消")
         btns.addWidget(ok)
         btns.addWidget(cancel)
         layout.addLayout(btns)
@@ -65,6 +65,78 @@ class ShareDialog(QDialog):
     
     def get_values(self):
         return self.period_input.text().strip(), self.pwd_input.text().strip(), self.remark_input.text().strip()
+
+class ExitConfirmDialog(QDialog):
+    """退出确认对话框"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("确认退出")
+        self.setFixedSize(400, 200)
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        
+        # 主布局
+        layout = QVBoxLayout(self)
+        layout.setSpacing(20)
+        layout.setContentsMargins(30, 30, 30, 30)
+        
+        # 图标和标题
+        title_layout = QHBoxLayout()
+        
+        # 添加问号图标
+        icon_label = QLabel()
+        icon_label.setPixmap(QIcon(get_icon_path('warning.png')).pixmap(48, 48))
+        title_layout.addWidget(icon_label)
+        
+        # 标题文本
+        title_text = QLabel("确定要退出程序吗？")
+        title_text.setFont(QFont("Microsoft YaHei", 14))
+        title_text.setStyleSheet("color: #333333;")
+        title_layout.addWidget(title_text)
+        title_layout.addStretch()
+        
+        layout.addLayout(title_layout)
+        
+        # 说明文本
+        desc_label = QLabel("程序将完全关闭，所有未保存的数据可能会丢失。")
+        desc_label.setFont(QFont("Microsoft YaHei", 10))
+        desc_label.setStyleSheet("color: #666666;")
+        desc_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(desc_label)
+        
+        layout.addStretch()
+        
+        # 按钮区域
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        # 取消按钮（默认选中）
+        cancel_btn = MaterialButton("取消")
+        cancel_btn.setDefault(True)
+        cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_btn)
+        
+        # 确定退出按钮（红色样式）
+        exit_btn = MaterialButton("确定")
+        exit_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #F44336;
+                color: white;
+                border: none;
+                padding: 12px 20px;
+                border-radius: 8px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #D32F2F;
+            }
+            QPushButton:pressed {
+                background-color: #B71C1C;
+            }
+        """)
+        exit_btn.clicked.connect(self.accept)
+        button_layout.addWidget(exit_btn)
+        
+        layout.addLayout(button_layout)
 
 class ActionCellDelegate(QStyledItemDelegate):
     def __init__(self, parent=None, text_color="#333333"):
@@ -201,8 +273,8 @@ class FileManagerUI(QMainWindow):
         self.initUI()
         self.setup_api_connections()
         
-        # 默认：进入公共资源页面
-        self.open_public_resources()
+        # 检查登录状态，决定进入哪个页面
+        self.check_login_status_and_navigate()
         
         # 设置窗口图标
         self.setWindowIcon(QIcon(get_icon_path('logo.png')))
@@ -237,6 +309,19 @@ class FileManagerUI(QMainWindow):
         self.api_client.auth_failed.connect(self.on_auth_failed)
         self.api_client.api_error.connect(self.on_api_error)
     
+    def check_login_status_and_navigate(self):
+        """检查登录状态并导航到相应页面"""
+        if self.api_client.is_logged_in():
+            # 已登录，进入公共资源页面
+            print("[DEBUG] 用户已登录，进入公共资源页面")
+            self.status_label.setText("已登录 - 公共资源")
+            self.open_public_resources()
+        else:
+            # 未登录，进入公共资源页面（演示模式）
+            print("[DEBUG] 用户未登录，进入公共资源页面（演示模式）")
+            self.status_label.setText("演示模式 - 点击用户信息进行登录")
+            self.open_public_resources()
+    
     def check_login_status(self):
         """检查登录状态"""
         if self.api_client.is_logged_in():
@@ -250,23 +335,17 @@ class FileManagerUI(QMainWindow):
     
     def show_login_dialog(self):
         """显示登录对话框"""
-        dialog = LoginDialog(self)
+        print(f"[DEBUG] 主界面: API客户端实例ID = {id(self.api_client)}")
+        dialog = LoginDialog(self, self.api_client)
         dialog.login_success.connect(self.on_login_success)
         dialog.exec()
     
     def on_login_success(self, data):
         """登录成功处理"""
-        # 切回用户态视图
-        self.in_public = False
-        try:
-            # 确保私有模型重新绑定
-            if self.file_tree.model() is not self.model:
-                self.file_tree.setModel(self.model)
-        except Exception:
-            pass
-        self.current_folder = '/'
-        self.status_label.setText("用户态：已登录，正在进入根目录 /")
-        self.load_files()
+        print("[DEBUG] 登录成功，进入公共资源页面")
+        # 登录成功后进入公共资源页面
+        self.status_label.setText("已登录 - 公共资源")
+        self.open_public_resources()
     
     def on_login_failed(self, error_msg):
         """登录失败处理"""
@@ -275,18 +354,15 @@ class FileManagerUI(QMainWindow):
     
     def on_auth_success(self, token_data):
         """授权成功处理"""
-        self.api_client.baidu_token = token_data
-        # 切回用户态视图
-        self.in_public = False
-        try:
-            if self.file_tree.model() is not self.model:
-                self.file_tree.setModel(self.model)
-        except Exception:
-            pass
-        self.current_folder = '/'
-        self.status_label.setText("用户态：授权成功，正在进入根目录 /")
+        print(f"[DEBUG] on_auth_success: user_jwt={'exists' if self.api_client.user_jwt else 'None'}")
+        
+        # 授权成功后进入公共资源页面
+        self.status_label.setText("已登录 - 公共资源")
         QMessageBox.information(self, "成功", "百度网盘授权成功！")
-        self.load_files()
+        
+        # 延迟进入公共资源，确保状态完全更新
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(100, self.open_public_resources)
     
     def on_auth_failed(self, error_msg):
         """授权失败处理"""
@@ -300,8 +376,16 @@ class FileManagerUI(QMainWindow):
     
     def load_files(self):
         """加载文件列表"""
-        if not self.api_client.is_logged_in():
-            self.show_login_dialog()
+        # 检查登录状态，添加调试信息
+        is_logged_in = self.api_client.is_logged_in()
+        user_jwt_info = f"exists (len={len(self.api_client.user_jwt)})" if self.api_client.user_jwt else 'None'
+        print(f"[DEBUG] load_files: is_logged_in={is_logged_in}, user_jwt={user_jwt_info}")
+        
+        if not is_logged_in:
+            print("[DEBUG] 用户未登录，进入公共资源页面（演示模式）")
+            # 未登录时进入公共资源页面，而不是显示登录对话框
+            self.status_label.setText("演示模式 - 点击用户信息进行登录")
+            self.open_public_resources()
             return
         
         # 确保从公共资源模式切换回用户态模型
@@ -828,15 +912,8 @@ class FileManagerUI(QMainWindow):
 
     def quit_application(self):
         """退出应用"""
-        reply = QMessageBox.question(
-            self,
-            '退出确认',
-            "确定要退出程序吗？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        
-        if reply == QMessageBox.Yes:
+        dialog = ExitConfirmDialog(self)
+        if dialog.exec() == QDialog.Accepted:
             try:
                 # 隐藏托盘图标并退出应用
                 self.tray_icon.hide()
@@ -1644,13 +1721,13 @@ class FileManagerUI(QMainWindow):
         else:
             # 未登录，显示登录对话框
             from ui.dialogs.login_dialog import LoginDialog
-            dialog = LoginDialog(self)
+            dialog = LoginDialog(self, self.api_client)  # 传入API客户端实例
             dialog.login_success.connect(self.on_login_success)
         dialog.exec()
     
     def open_deepseek_dialog(self):
         """打开DeepSeek对话框"""
-        QMessageBox.information(self, "智能问答", "智能问答功能已移除业务逻辑，仅保留界面。")
+        QMessageBox.information(self, "智能问答", "智能问答功能研发中。")
 
     def show_context_menu(self, position):
         """显示公共资源表格的右键菜单（阅读/下载/分享/举报）"""

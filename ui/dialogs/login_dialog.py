@@ -19,10 +19,18 @@ class LoginDialog(QDialog):
     
     login_success = Signal(dict)  # 登录成功信号
     
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, api_client=None):
         super().__init__(parent)
-        self.api_client = APIClient()
+        # 使用传入的API客户端实例，如果没有则创建新的
+        self.api_client = api_client or APIClient()
         self.auth_thread = None
+        
+        # 调试信息：检查API客户端实例
+        print(f"[DEBUG] 登录对话框: API客户端实例ID = {id(self.api_client)}")
+        if api_client:
+            print(f"[DEBUG] 登录对话框: 使用传入的API客户端实例")
+        else:
+            print(f"[DEBUG] 登录对话框: 创建了新的API客户端实例")
         
         self.setWindowTitle("用户登录")
         self.setFixedSize(500, 600)
@@ -190,8 +198,7 @@ class LoginDialog(QDialog):
         layout.addWidget(self.auth_status_label)
         
         # 重新生成二维码按钮（无图标）
-        from PySide6.QtWidgets import QPushButton
-        self.start_auth_btn = QPushButton("重新生成二维码")
+        self.start_auth_btn = MaterialButton("重新生成二维码")
         self.start_auth_btn.setFixedHeight(36)
         layout.addWidget(self.start_auth_btn)
         
@@ -304,24 +311,40 @@ class LoginDialog(QDialog):
         # 更新状态显示
         self.auth_status_label.setText(f"登录成功！欢迎 {username}")
         
-        # 向父级发送登录成功信号（刷新主界面等）
-        self.login_success.emit(token_data)
+        # 检查JWT token是否已正确设置
+        jwt_token = token_data.get("jwt_token")
+        if jwt_token and self.api_client.user_jwt == jwt_token:
+            print(f"[DEBUG] 登录对话框: JWT token已正确设置")
+            # 向父级发送登录成功信号（刷新主界面等）
+            self.login_success.emit(token_data)
+        else:
+            print(f"[DEBUG] 登录对话框: JWT token设置异常，等待设置完成...")
+            # 等待JWT token设置完成
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(200, lambda: self.check_and_emit_success(token_data))
         
         # 安全停止轮询线程并断开信号
         if self.auth_thread:
             try:
+                # 断开所有信号连接
                 self.auth_thread.auth_success.disconnect()
                 self.auth_thread.auth_failed.disconnect()
                 self.auth_thread.status_update.disconnect()
             except Exception:
                 pass
+            
             try:
                 if self.auth_thread.isRunning():
                     self.auth_thread.stop()
-                    self.auth_thread.wait(500)
+                    # 等待线程结束，设置超时避免阻塞
+                    if not self.auth_thread.wait(500):
+                        print("警告：授权线程在成功回调中未能及时停止")
+                        self.auth_thread.terminate()
+                        self.auth_thread.wait(200)
             except Exception:
                 pass
-            self.auth_thread = None
+            finally:
+                self.auth_thread = None
         
         # 异步关闭对话框，避免与当前槽冲突
         try:
@@ -329,6 +352,18 @@ class LoginDialog(QDialog):
             QTimer.singleShot(0, self.accept)
         except Exception:
             self.accept()
+    
+    def check_and_emit_success(self, token_data):
+        """检查JWT token设置并发送成功信号"""
+        jwt_token = token_data.get("jwt_token")
+        if jwt_token and self.api_client.user_jwt == jwt_token:
+            print(f"[DEBUG] 登录对话框: JWT token设置完成，发送成功信号")
+            self.login_success.emit(token_data)
+        else:
+            print(f"[DEBUG] 登录对话框: JWT token仍未设置，重试...")
+            # 再次等待
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(200, lambda: self.check_and_emit_success(token_data))
     
     def on_auth_failed(self, error_msg):
         """授权失败处理"""
@@ -341,7 +376,23 @@ class LoginDialog(QDialog):
     
     def closeEvent(self, event):
         """关闭事件处理"""
+        # 安全停止轮询线程
         if self.auth_thread and self.auth_thread.isRunning():
+            try:
+                # 断开所有信号连接，避免关闭时的信号冲突
+                self.auth_thread.auth_success.disconnect()
+                self.auth_thread.auth_failed.disconnect()
+                self.auth_thread.status_update.disconnect()
+            except Exception:
+                pass
+            
+            # 停止线程
             self.auth_thread.stop()
-            self.auth_thread.wait()
+            # 等待线程结束，但设置超时避免无限等待
+            if not self.auth_thread.wait(1000):  # 1秒超时
+                print("警告：授权线程未能及时停止")
+                self.auth_thread.terminate()  # 强制终止
+                self.auth_thread.wait(500)   # 再等待0.5秒
+            self.auth_thread = None
+        
         event.accept()

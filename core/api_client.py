@@ -14,6 +14,9 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
 from PySide6.QtCore import QObject, Signal
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 class APIClient(QObject):
@@ -40,6 +43,9 @@ class APIClient(QObject):
             'User-Agent': 'PanClient/1.0.0'
         })
         
+        # 初始化加密密钥
+        self._encryption_key = self._generate_encryption_key()
+        
         # 尝试加载本地token（免登录）
         self.load_tokens()
         # 多账号：加载账号库并切换到当前账号
@@ -57,27 +63,44 @@ class APIClient(QObject):
         return base / 'auth_tokens.json'
     
     def save_tokens(self, jwt_token: Optional[str], baidu_token: Optional[Dict[str, Any]] = None, user_info: Optional[Dict[str, Any]] = None):
-        """保存token与用户信息到本地"""
+        """保存token与用户信息到本地（加密存储）"""
         try:
             data = {
                 'jwt_token': jwt_token or self.user_jwt,
                 'baidu_token': baidu_token or self.baidu_token,
                 'user_info': user_info,
             }
+            
+            # 将数据转换为JSON字符串
+            json_data = json.dumps(data, ensure_ascii=False, indent=2)
+            
+            # 加密数据
+            encrypted_data = self._encrypt_data(json_data)
+            
+            # 保存加密后的数据
             path = self.get_tokens_store_path()
-            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+            path.write_text(encrypted_data, encoding='utf-8')
         except Exception as e:
             print(f"保存token失败: {e}")
     
     def load_tokens(self):
-        """从本地加载token与用户信息"""
+        """从本地加载token与用户信息（解密读取）"""
         try:
             path = self.get_tokens_store_path()
             if path.exists():
-                data = json.loads(path.read_text(encoding='utf-8') or '{}')
-                self.user_jwt = data.get('jwt_token') or None
-                self.baidu_token = data.get('baidu_token') or None
-                self.user_info = data.get('user_info') or None
+                encrypted_data = path.read_text(encoding='utf-8')
+                if encrypted_data:
+                    # 尝试解密数据
+                    try:
+                        decrypted_data = self._decrypt_data(encrypted_data)
+                        data = json.loads(decrypted_data)
+                    except Exception:
+                        # 如果解密失败，可能是旧格式的明文数据，尝试直接解析
+                        data = json.loads(encrypted_data)
+                    
+                    self.user_jwt = data.get('jwt_token') or None
+                    self.baidu_token = data.get('baidu_token') or None
+                    self.user_info = data.get('user_info') or None
         except Exception as e:
             print(f"加载token失败: {e}")
     
@@ -102,10 +125,24 @@ class APIClient(QObject):
         return self._accounts_dir() / 'accounts.json'
 
     def load_accounts(self):
-        """从本地加载账号信息"""
+        """从本地加载账号信息（解密读取）"""
         try:
             p = self._accounts_path()
-            data = json.loads(p.read_text(encoding='utf-8')) if p.exists() else {}
+            if p.exists():
+                encrypted_data = p.read_text(encoding='utf-8')
+                if encrypted_data:
+                    # 尝试解密数据
+                    try:
+                        decrypted_data = self._decrypt_data(encrypted_data)
+                        data = json.loads(decrypted_data)
+                    except Exception:
+                        # 如果解密失败，可能是旧格式的明文数据，尝试直接解析
+                        data = json.loads(encrypted_data)
+                else:
+                    data = {}
+            else:
+                data = {}
+            
             self.accounts = data.get('accounts', {})
             self.current_account_uk = data.get('current_account_uk')
         except Exception:
@@ -113,14 +150,22 @@ class APIClient(QObject):
             self.current_account_uk = None
 
     def save_accounts(self):
-        """保存账号信息到本地"""
+        """保存账号信息到本地（加密存储）"""
         try:
             p = self._accounts_path()
             payload = {
                 'accounts': self.accounts,
                 'current_account_uk': self.current_account_uk
             }
-            p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+            
+            # 将数据转换为JSON字符串
+            json_data = json.dumps(payload, ensure_ascii=False, indent=2)
+            
+            # 加密数据
+            encrypted_data = self._encrypt_data(json_data)
+            
+            # 保存加密后的数据
+            p.write_text(encrypted_data, encoding='utf-8')
         except Exception as e:
             print(f"保存accounts失败: {e}")
 
@@ -198,6 +243,50 @@ class APIClient(QObject):
             print(f"生成设备指纹失败: {e}")
             # 使用备用方案
             return hashlib.md5(f"fallback_{uuid.uuid4()}".encode()).hexdigest()
+    
+    def _generate_encryption_key(self) -> bytes:
+        """生成加密密钥"""
+        try:
+            # 使用设备指纹作为盐值
+            salt = self.device_fingerprint.encode()[:16]  # 取前16字节作为盐值
+            # 使用固定的密码短语（可以基于设备信息生成）
+            password = f"pan_client_{self.device_fingerprint}".encode()
+            
+            # 使用PBKDF2生成密钥
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=salt,
+                iterations=100000,
+            )
+            key = base64.urlsafe_b64encode(kdf.derive(password))
+            return key
+        except Exception as e:
+            print(f"生成加密密钥失败: {e}")
+            # 使用备用方案
+            fallback_key = hashlib.sha256(f"fallback_{self.device_fingerprint}".encode()).digest()
+            return base64.urlsafe_b64encode(fallback_key)
+    
+    def _encrypt_data(self, data: str) -> str:
+        """加密数据"""
+        try:
+            fernet = Fernet(self._encryption_key)
+            encrypted_data = fernet.encrypt(data.encode())
+            return base64.b64encode(encrypted_data).decode()
+        except Exception as e:
+            print(f"加密数据失败: {e}")
+            return data  # 加密失败时返回原数据
+    
+    def _decrypt_data(self, encrypted_data: str) -> str:
+        """解密数据"""
+        try:
+            fernet = Fernet(self._encryption_key)
+            encrypted_bytes = base64.b64decode(encrypted_data.encode())
+            decrypted_data = fernet.decrypt(encrypted_bytes)
+            return decrypted_data.decode()
+        except Exception as e:
+            print(f"解密数据失败: {e}")
+            return encrypted_data  # 解密失败时返回原数据
     
     def login(self, username: str, password: str) -> bool:
         """用户登录"""

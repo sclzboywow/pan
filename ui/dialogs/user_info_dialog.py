@@ -3,6 +3,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QWidge
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon, QFont, QPixmap
 from core.utils import get_icon_path
+from ui.widgets.material_button import MaterialButton
 
 class UserInfoDialog(QDialog):
     def __init__(self, parent=None, api_client=None):
@@ -132,18 +133,18 @@ class UserInfoDialog(QDialog):
 
         # 操作按钮区
         btn_row = QHBoxLayout()
-        refresh_space_btn = QPushButton("刷新空间配额")
+        refresh_space_btn = MaterialButton("刷新空间配额")
         refresh_space_btn.clicked.connect(self.refresh_quota)
         btn_row.addWidget(refresh_space_btn)
-        refresh_today_btn = QPushButton("刷新今日额度")
+        refresh_today_btn = MaterialButton("刷新今日额度")
         refresh_today_btn.clicked.connect(self.refresh_today_quota)
         btn_row.addWidget(refresh_today_btn)
         
-        switch_btn = QPushButton("切换账号")
+        switch_btn = MaterialButton("切换账号")
         switch_btn.clicked.connect(self.on_switch_account)
         btn_row.addWidget(switch_btn)
         
-        manage_btn = QPushButton("删除账号")
+        manage_btn = MaterialButton("删除账号")
         manage_btn.clicked.connect(self.on_remove_account)
         btn_row.addWidget(manage_btn)
         
@@ -231,8 +232,14 @@ class UserInfoDialog(QDialog):
         # 弹出选择对话框
         dlg = QDialog(self)
         dlg.setWindowTitle("切换账号")
-        dlg.setFixedSize(360, 320)
+        dlg.setFixedSize(400, 380)
         v = QVBoxLayout(dlg)
+        
+        # 添加说明文字
+        info_label = QLabel("选择要切换的账号，或添加新账号：")
+        info_label.setStyleSheet("color: #666; font-size: 12px; margin-bottom: 10px;")
+        v.addWidget(info_label)
+        
         lst = QListWidget()
         for uk, data in accounts.items():
             ui = data.get('user_info') or {}
@@ -242,8 +249,28 @@ class UserInfoDialog(QDialog):
             lst.addItem(item)
         v.addWidget(lst)
         btns = QHBoxLayout()
-        ok = QPushButton("确定")
-        cancel = QPushButton("取消")
+        add_new = MaterialButton("添加新账号")
+        # 为添加新账号按钮设置特殊样式
+        add_new.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border: none;
+                padding: 12px 20px;
+                border-radius: 8px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+        """)
+        ok = MaterialButton("确定")
+        cancel = MaterialButton("取消")
+        btns.addWidget(add_new)
+        btns.addStretch()
         btns.addWidget(ok)
         btns.addWidget(cancel)
         v.addLayout(btns)
@@ -255,6 +282,27 @@ class UserInfoDialog(QDialog):
                 return
             chosen['uk'] = it.data(0x0100)
             dlg.accept()
+        def _on_new_account_login(data):
+            """新账号登录成功处理"""
+            QMessageBox.information(self, "成功", "新账号登录成功！")
+            # 刷新用户信息显示
+            if hasattr(self.api_client, 'user_info') and self.api_client.user_info:
+                self.set_user_info(self.api_client.user_info)
+            # 通知父窗口更新状态
+            if self.parent() and hasattr(self.parent(), 'status_label'):
+                name = (self.api_client.user_info or {}).get('baidu_name') or '已登录'
+                self.parent().status_label.setText(f"已登录：{name}")
+        
+        def _add_new_account():
+            """添加新账号"""
+            dlg.reject()  # 关闭当前对话框
+            # 打开登录对话框添加新账号
+            from ui.dialogs.login_dialog import LoginDialog
+            login_dialog = LoginDialog(self, self.api_client)
+            login_dialog.login_success.connect(_on_new_account_login)
+            login_dialog.exec()
+        
+        add_new.clicked.connect(_add_new_account)
         ok.clicked.connect(_accept)
         cancel.clicked.connect(dlg.reject)
         lst.itemDoubleClicked.connect(lambda it: (chosen.__setitem__('uk', it.data(0x0100)), dlg.accept()))

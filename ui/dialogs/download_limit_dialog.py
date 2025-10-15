@@ -3,6 +3,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QWidge
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
 from core.utils import get_icon_path
+from ui.widgets.material_button import MaterialButton
 
 class DownloadLimitDialog(QDialog):
     """下载限制提示对话框"""
@@ -94,24 +95,8 @@ class DownloadLimitDialog(QDialog):
         button_layout.addStretch(1)  # 添加弹性空间，使按钮靠右对齐
         
         # 取消按钮
-        cancel_btn = QPushButton("关闭")
+        cancel_btn = MaterialButton("关闭")
         cancel_btn.setFixedSize(100, 40)  # 减小宽度
-        cancel_btn.setStyleSheet("""
-            QPushButton {
-                background: #F5F5F5;
-                color: #666666;
-                border: none;
-                border-radius: 20px;
-                font-size: 14px;
-                padding: 0 15px;
-            }
-            QPushButton:hover {
-                background: #EEEEEE;
-            }
-            QPushButton:pressed {
-                background: #E0E0E0;
-            }
-        """)
         cancel_btn.clicked.connect(self.handle_ok_click)
         button_layout.addWidget(cancel_btn)
         
