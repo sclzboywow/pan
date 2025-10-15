@@ -375,6 +375,37 @@ class APIClient(QObject):
             print(f"获取配额失败: {e}")
             return None
 
+    def get_quota_today(self) -> Optional[Dict[str, Any]]:
+        """获取用户今日阅读/下载/分享共用配额（需登录）"""
+        if not self.user_jwt:
+            return None
+        try:
+            resp = self.session.get(f"{self.base_url}/quota/today")
+            if resp.status_code == 200:
+                return resp.json()
+            # 返回统一错误结构
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"error": resp.text or str(resp.status_code)}
+            return {"status": "error", "error": data.get("error") or data}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    # ---------- 前置查重（MD5） ----------
+    def files_dedup_md5(self, md5_hex: str, sample_limit: int = 5) -> Optional[Dict[str, Any]]:
+        """查重：GET /files/dedup/md5?md5=...&sample_limit=...（需登录）"""
+        if not self.user_jwt:
+            return {"status": "error", "error": "not_logged_in"}
+        try:
+            url = f"{self.base_url}/files/dedup/md5"
+            headers = {"Authorization": f"Bearer {self.user_jwt}"}
+            params = {"md5": md5_hex, "sample_limit": int(sample_limit)}
+            resp = self.session.get(url, params=params, headers=headers)
+            return resp.json() if resp.content else {"status": "error", "error": "empty_response"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
     def refresh_and_cache_user_quota(self):
         """拉取配额并写入本地缓存的 user_info.quota"""
         quota = self.get_quota_info()
@@ -436,6 +467,78 @@ class APIClient(QObject):
             "remote_path": remote_path,
             "concurrent": concurrent
         })
+
+    # ---------- 公共/用户：上传（URL/文本/本地/批量） ----------
+    def user_upload_url(self, url: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
+        return self.call_api("upload_url", {"url": url, "dir": dir_path, "filename": filename})
+
+    def public_upload_url(self, url: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
+        return self.call_public_api("upload_url", {"url": url, "dir": dir_path, "filename": filename})
+
+    def user_upload_text(self, content: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
+        return self.call_api("upload_text", {"content": content, "dir": dir_path, "filename": filename})
+
+    def public_upload_text(self, content: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
+        return self.call_public_api("upload_text", {"content": content, "dir": dir_path, "filename": filename})
+
+    def public_upload_local_file(self, local_path: str, remote_path: str, concurrent: int = 3) -> Optional[Dict[str, Any]]:
+        return self.call_public_api("upload_local", {
+            "local_path": local_path,
+            "remote_path": remote_path,
+            "concurrent": concurrent
+        })
+
+    def user_upload_batch_url(self, url_list: list) -> Optional[Dict[str, Any]]:
+        # url_list: [{"url":"...","dir_path":"/用户上传/...","filename":"..."}, ...]
+        return self.call_api("upload_batch_url", {"url_list": url_list})
+
+    def public_upload_batch_url(self, url_list: list) -> Optional[Dict[str, Any]]:
+        return self.call_public_api("upload_batch_url", {"url_list": url_list})
+
+    def user_upload_batch_text(self, text_list: list) -> Optional[Dict[str, Any]]:
+        # text_list: [{"content":"...","dir":"/用户上传/...","filename":"..."}, ...]
+        return self.call_api("upload_batch_text", {"text_list": text_list})
+
+    def public_upload_batch_text(self, text_list: list) -> Optional[Dict[str, Any]]:
+        return self.call_public_api("upload_batch_text", {"text_list": text_list})
+
+    def user_upload_batch_local(self, file_list: list) -> Optional[Dict[str, Any]]:
+        # file_list: [{"local_path":"...","remote_path":"/用户上传/..."}, ...]
+        return self.call_api("upload_batch_local", {"file_list": file_list})
+
+    def public_upload_batch_local(self, file_list: list) -> Optional[Dict[str, Any]]:
+        return self.call_public_api("upload_batch_local", {"file_list": file_list})
+
+    def public_upload_multipart(self, dir_path: str, local_path: str, filename: str = None, md5: str = None) -> Optional[Dict[str, Any]]:
+        """公共态：multipart 文件直传到后端 /upload，强制写入 /用户上传 下（需登录）"""
+        try:
+            if not self.user_jwt:
+                return {"status": "error", "error": "not_logged_in"}
+            url = f"{self.base_url}/upload"
+            fn = filename or (os.path.basename(local_path) if local_path else None)
+            if not fn:
+                return {"status": "error", "error": "invalid_filename"}
+            with open(local_path, 'rb') as f:
+                files = {
+                    'file': (fn, f, 'application/octet-stream')
+                }
+                data = {
+                    'dir': dir_path,
+                    'filename': fn
+                }
+                # 如果提供了MD5，添加到表单数据中
+                if md5:
+                    data['md5'] = md5
+                headers = {
+                    'Authorization': f'Bearer {self.user_jwt}'
+                }
+                # use a plain requests.post to avoid session headers Content-Type conflict
+                resp = requests.post(url, data=data, files=files, headers=headers)
+                return resp.json() if resp.content else {"status": "error", "error": "empty_response"}
+        except FileNotFoundError:
+            return {"status": "error", "error": "local_file_not_found"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
     
     def upload_url_file(self, url: str, remote_path: str) -> Optional[Dict[str, Any]]:
         """上传URL文件"""
@@ -600,6 +703,30 @@ class APIClient(QObject):
         except Exception as e:
             print(f"files_statuses失败: {e}")
             return None
+
+    # ---------- 公共资源举报 ----------
+    def public_report_submit(self, target: str, reason: str):
+        """提交公共资源举报（需登录）"""
+        try:
+            if not self.user_jwt:
+                return {"status": "error", "error": "not_logged_in"}
+            url = f"{self.base_url}/reports/public"
+            params = {"target": str(target), "reason": str(reason or '')[:200]}
+            headers = {"Authorization": f"Bearer {self.user_jwt}"}
+            resp = self.session.post(url, params=params, headers=headers)
+            return resp.json() if resp.content else {"status": "error", "error": "empty_response"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def public_report_count(self, target: str):
+        """查询被举报次数（公开）"""
+        try:
+            url = f"{self.base_url}/reports/public/count"
+            params = {"target": str(target)}
+            resp = self.session.get(url, params=params)
+            return resp.json() if resp.content else {"status": "error", "error": "empty_response"}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     def public_share_create(self, fsids: list, period: int = 7, pwd: str = "", remark: str = ""):
         """创建公共资源分享链接（使用服务态token）"""

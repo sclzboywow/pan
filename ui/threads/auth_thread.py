@@ -77,7 +77,7 @@ class AutoAuthThread(QThread):
             )
             
             if result:
-                if result.get("status") == "success":
+                if (result.get("status") or "").lower() in ("success", "ok"):
                     # 打印完整成功响应
                     try:
                         print("[AUTH SUCCESS]", json.dumps(result, ensure_ascii=False, indent=2))

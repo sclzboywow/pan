@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QWidget, 
                               QFrame, QPushButton, QApplication, QMessageBox, QListWidget, QListWidgetItem)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QIcon, QFont, QPixmap
 from core.utils import get_icon_path
 
@@ -18,6 +18,7 @@ class UserInfoDialog(QDialog):
         self.baidu_name_label = None
         self.vip_label = None
         self.quota_label = None
+        self.today_quota_label = None
         
         self.setup_ui()
         
@@ -89,6 +90,15 @@ class UserInfoDialog(QDialog):
         self.avatar_label.setFixedSize(80, 80)
         self.avatar_label.setStyleSheet("border-radius:40px; background:#f5f5f5;")
         self.avatar_label.setAlignment(Qt.AlignCenter)
+        # 点击头像复制前端用户名（服务器用户名）
+        try:
+            self.avatar_label.setCursor(Qt.PointingHandCursor)
+            def _on_avatar_click(evt):
+                self.copy_frontend_username()
+            self.avatar_label.mousePressEvent = _on_avatar_click
+            self.avatar_label.setToolTip("点击复制前端用户名")
+        except Exception:
+            pass
         main_layout.addWidget(self.avatar_label, alignment=Qt.AlignHCenter)
 
         # 百度网盘昵称（主标题）
@@ -103,17 +113,31 @@ class UserInfoDialog(QDialog):
         self.vip_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(self.vip_label)
 
-        # 配额
+        # 配额（总空间）
         self.quota_label = QLabel("空间: 加载中...")
         self.quota_label.setStyleSheet("color:#666;")
         self.quota_label.setAlignment(Qt.AlignCenter)
         main_layout.addWidget(self.quota_label)
 
+        # 今日额度
+        self.today_quota_label = QLabel("今日额度: 加载中...")
+        self.today_quota_label.setStyleSheet("color:#1976D2;")
+        self.today_quota_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.today_quota_label)
+        # 共用额度说明
+        quota_note = QLabel("说明：阅读 / 下载 / 分享 共用每日总额度")
+        quota_note.setAlignment(Qt.AlignCenter)
+        quota_note.setStyleSheet("color:#999; font-size:12px;")
+        main_layout.addWidget(quota_note)
+
         # 操作按钮区
         btn_row = QHBoxLayout()
-        refresh_btn = QPushButton("刷新空间配额")
-        refresh_btn.clicked.connect(self.refresh_quota)
-        btn_row.addWidget(refresh_btn)
+        refresh_space_btn = QPushButton("刷新空间配额")
+        refresh_space_btn.clicked.connect(self.refresh_quota)
+        btn_row.addWidget(refresh_space_btn)
+        refresh_today_btn = QPushButton("刷新今日额度")
+        refresh_today_btn.clicked.connect(self.refresh_today_quota)
+        btn_row.addWidget(refresh_today_btn)
         
         switch_btn = QPushButton("切换账号")
         switch_btn.clicked.connect(self.on_switch_account)
@@ -128,6 +152,9 @@ class UserInfoDialog(QDialog):
         main_layout.addStretch()
         self.setLayout(main_layout)
 
+        # 初次拉取今日额度
+        QTimer.singleShot(0, self.refresh_today_quota)
+
     def refresh_quota(self):
         if not self.api_client:
             QMessageBox.warning(self, "提示", "API 未初始化")
@@ -136,11 +163,50 @@ class UserInfoDialog(QDialog):
         if hasattr(self.api_client, 'user_info') and self.api_client.user_info:
             self.set_user_info(self.api_client.user_info)
 
+    def refresh_today_quota(self):
+        if not self.api_client or not self.api_client.is_logged_in():
+            if self.today_quota_label:
+                self.today_quota_label.setText("今日额度: 未登录")
+            return
+        data = self.api_client.get_quota_today()
+        if isinstance(data, dict) and data.get('status') == 'ok':
+            q = data.get('data') or {}
+            role = q.get('role') or '-'
+            used = q.get('used') or 0
+            total = q.get('total') or 0
+            left = q.get('left') if q.get('left') is not None else max(int(total) - int(used), 0)
+            if self.today_quota_label:
+                self.today_quota_label.setText(f"今日额度（{role}）: 已用 {used} / 总计 {total}，剩余 {left}")
+        else:
+            err = (data or {}).get('error') if isinstance(data, dict) else 'unknown'
+            if self.today_quota_label:
+                self.today_quota_label.setText(f"今日额度: 获取失败（{err}）")
+
     def copy_machine_code(self, code):
         """复制机器码到剪贴板"""
         clipboard = QApplication.clipboard()
         clipboard.setText(code)
         QMessageBox.information(self, "复制成功", "机器码已复制到剪贴板") 
+
+    def copy_frontend_username(self):
+        """复制服务器端前端用户名（非百度昵称）"""
+        try:
+            username = None
+            if self.api_client:
+                # 优先从 user_info 取用户名
+                ui = getattr(self.api_client, 'user_info', None) or {}
+                username = ui.get('username') or None
+                if not username:
+                    me = self.api_client.get_user_info()
+                    if isinstance(me, dict):
+                        username = me.get('username')
+            if not username:
+                QMessageBox.information(self, "复制失败", "未获取到前端用户名")
+                return
+            QApplication.clipboard().setText(str(username))
+            QMessageBox.information(self, "复制成功", f"已复制前端用户名：{username}")
+        except Exception as e:
+            QMessageBox.warning(self, "复制失败", str(e))
 
     def on_logout(self):
         if not self.api_client:

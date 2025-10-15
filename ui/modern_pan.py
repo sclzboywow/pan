@@ -7,7 +7,9 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                               QTreeView, QFileDialog, QMessageBox, QProgressBar,
                               QStatusBar, QSystemTrayIcon, QMenu, QFrame,
                               QGraphicsDropShadowEffect, QHeaderView, QDialog,
-                              QGroupBox, QGridLayout, QAbstractItemView, QStyle)
+                              QGroupBox, QGridLayout, QAbstractItemView, QStyle,
+                              QListWidget, QListWidgetItem, QListView, QFileIconProvider)
+from PySide6.QtCore import QFileInfo
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QSize, QPoint, QPropertyAnimation, Property, QRectF
 from PySide6.QtGui import (QStandardItemModel, QStandardItem, QIcon, QFont, 
                           QColor, QPainter, QPen, QPainterPath, QBrush, QPixmap,
@@ -22,7 +24,7 @@ from ui.dialogs.login_dialog import LoginDialog
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtCore import QUrl
 from datetime import datetime
-from PySide6.QtWidgets import QStyledItemDelegate
+from PySide6.QtWidgets import QStyledItemDelegate, QInputDialog
 from PySide6.QtGui import QPalette
 import requests
 from urllib.parse import urlencode
@@ -223,6 +225,9 @@ class FileManagerUI(QMainWindow):
         
         # 连接滚动信号
         self.file_tree.verticalScrollBar().valueChanged.connect(self.check_scroll_position)
+        
+        # 异步上传任务列表，避免线程被GC回收
+        self.active_upload_workers = []
     
     def setup_api_connections(self):
         """设置API客户端信号连接"""
@@ -251,7 +256,16 @@ class FileManagerUI(QMainWindow):
     
     def on_login_success(self, data):
         """登录成功处理"""
-        self.status_label.setText("已登录")
+        # 切回用户态视图
+        self.in_public = False
+        try:
+            # 确保私有模型重新绑定
+            if self.file_tree.model() is not self.model:
+                self.file_tree.setModel(self.model)
+        except Exception:
+            pass
+        self.current_folder = '/'
+        self.status_label.setText("用户态：已登录，正在进入根目录 /")
         self.load_files()
     
     def on_login_failed(self, error_msg):
@@ -262,7 +276,15 @@ class FileManagerUI(QMainWindow):
     def on_auth_success(self, token_data):
         """授权成功处理"""
         self.api_client.baidu_token = token_data
-        self.status_label.setText("授权成功")
+        # 切回用户态视图
+        self.in_public = False
+        try:
+            if self.file_tree.model() is not self.model:
+                self.file_tree.setModel(self.model)
+        except Exception:
+            pass
+        self.current_folder = '/'
+        self.status_label.setText("用户态：授权成功，正在进入根目录 /")
         QMessageBox.information(self, "成功", "百度网盘授权成功！")
         self.load_files()
     
@@ -282,18 +304,54 @@ class FileManagerUI(QMainWindow):
             self.show_login_dialog()
             return
         
+        # 确保从公共资源模式切换回用户态模型
+        self.in_public = False
+        try:
+            if self.file_tree.model() is not self.model:
+                self.file_tree.setModel(self.model)
+        except Exception:
+            pass
+
+        # 视图切换：显示图标网格，隐藏公共树表
+        try:
+            self.icon_grid.show()
+            self.file_tree.hide()
+        except Exception:
+            pass
+
         self.is_loading = True
-        self.status_label.setText("正在加载文件...")
+        try:
+            cur_path = self.current_folder or '/'
+            self.status_label.setText(f"用户态：正在加载 {cur_path}")
+        except Exception:
+            self.status_label.setText("用户态：正在加载文件...")
         
-        # 调用API获取文件列表
+        # 调用API获取文件列表（兼容多种返回格式）
         result = self.api_client.list_files(self.current_folder, self.page_size)
-        if result and result.get("status") == "ok":
-            data = result.get("data", {})
-            files = data.get("list", [])
-            self.display_files(files)
-            self.status_label.setText(f"已加载 {len(files)} 个文件")
+        ok_flag = False
+        files = []
+        if isinstance(result, dict):
+            status_val = str(result.get("status", "")).lower()
+            ok_flag = (status_val in ("ok", "success")) or ("data" in result) or ("list" in result)
+            data = result.get("data") if isinstance(result.get("data"), dict) else result
+            files = (data or {}).get("list") or (data or {}).get("files") or (data or {}).get("items") or []
+        elif isinstance(result, list):
+            ok_flag = True
+            files = result
+
+        if ok_flag:
+            try:
+                self.populate_icon_grid(files)
+                try:
+                    cur_path = self.current_folder or '/'
+                    self.status_label.setText(f"用户态：{cur_path} 已加载 {len(files)} 项")
+                except Exception:
+                    self.status_label.setText(f"用户态：已加载 {len(files)} 项")
+            except Exception as e:
+                self.status_label.setText(f"显示失败: {e}")
+                QMessageBox.critical(self, "错误", f"显示失败: {e}")
         else:
-            error_msg = result.get("error", "加载文件失败") if result else "网络连接失败"
+            error_msg = (result or {}).get("error", "加载文件失败") if isinstance(result, dict) else "网络连接失败"
             self.status_label.setText(f"加载失败: {error_msg}")
             QMessageBox.critical(self, "错误", f"加载文件失败: {error_msg}")
         
@@ -598,7 +656,64 @@ class FileManagerUI(QMainWindow):
             }
         """)
         
+        # 图标网格（用户态主页）
+        self.icon_grid = QListWidget()
+        self.icon_grid.setViewMode(QListView.IconMode)
+        self.icon_grid.setResizeMode(QListView.Adjust)
+        self.icon_grid.setMovement(QListView.Static)
+        self.icon_grid.setIconSize(QSize(64, 64))
+        self.icon_grid.setGridSize(QSize(120, 120))
+        self.icon_grid.setSpacing(12)
+        self.icon_grid.setUniformItemSizes(True)
+        self.icon_grid.setWordWrap(True)
+        self.icon_grid.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.icon_grid.itemDoubleClicked.connect(self.on_grid_item_double_clicked)
+        self.icon_grid.hide()
+        # 去掉选中边框与焦点虚线
+        self.icon_grid.setStyleSheet(
+            """
+            QListWidget { border: none; outline: none; }
+            QListWidget::item { border: none; }
+            QListWidget::item:selected { background: #E3F2FD; border: none; color: #1976D2; }
+            /* 垂直滚动条样式（与公共资源一致） */
+            QScrollBar:vertical {
+                border: none;
+                background: #F5F5F5;
+                width: 10px;
+                margin: 0 0 0 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #BDBDBD;
+                border-radius: 5px;
+                min-height: 30px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #9E9E9E;
+            }
+            QScrollBar::add-line:vertical { height: 0px; }
+            QScrollBar::sub-line:vertical { height: 0px; }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+            /* 水平滚动条样式（与公共资源一致） */
+            QScrollBar:horizontal {
+                border: none;
+                background: #F5F5F5;
+                height: 10px;
+                margin: 0 10px 0 0;
+            }
+            QScrollBar::handle:horizontal {
+                background: #BDBDBD;
+                border-radius: 5px;
+                min-width: 30px;
+            }
+            QScrollBar::handle:horizontal:hover { background: #9E9E9E; }
+            QScrollBar::add-line:horizontal { width: 0px; }
+            QScrollBar::sub-line:horizontal { width: 0px; }
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
+            """
+        )
+
         content_layout.addWidget(self.file_tree)  # 将文件树添加到内容区布局
+        content_layout.addWidget(self.icon_grid)  # 用户态图标网格
         
         main_layout.addWidget(content_area)
         
@@ -682,6 +797,17 @@ class FileManagerUI(QMainWindow):
 
     def closeEvent(self, event):
         """重写关闭事件"""
+        # 优雅停止活动的上传线程
+        try:
+            for w in list(getattr(self, 'active_upload_workers', []) or []):
+                try:
+                    if w.isRunning():
+                        w.stop()
+                        w.wait(2000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         event.ignore()
         self.hide()
         self.tray_icon.showMessage(
@@ -723,59 +849,233 @@ class FileManagerUI(QMainWindow):
 
     def go_home(self):
         """返回主页"""
+        # 切回用户态并加载网盘根目录
+        self.in_public = False
+        try:
+            if self.file_tree.model() is not self.model:
+                self.file_tree.setModel(self.model)
+            # 切换视图为图标网格
+            self.icon_grid.show()
+            self.file_tree.hide()
+        except Exception:
+            pass
         self.current_folder = '/'
+        self.status_label.setText("用户态：正在进入根目录 /")
         self.load_files()
+
+    def populate_icon_grid(self, files):
+        """将文件列表填充到图标网格"""
+        try:
+            self.icon_grid.clear()
+            provider = QFileIconProvider()
+            for it in files:
+                name = it.get('server_filename') or it.get('file_name') or it.get('name') or ''
+                isdir = int(it.get('isdir') or 0)
+                # 使用系统文件图标：目录/文件
+                if isdir == 1:
+                    icon = provider.icon(QFileIconProvider.Folder)
+                else:
+                    # 通过文件名后缀推断系统图标
+                    fi = QFileInfo(name)
+                    icon = provider.icon(fi)
+                item = QListWidgetItem(icon, name)
+                item.setData(Qt.UserRole, it)
+                item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+                self.icon_grid.addItem(item)
+        except Exception as e:
+            QMessageBox.warning(self, "主页", f"填充失败：{e}")
+
+    def on_grid_item_double_clicked(self, item):
+        """双击图标：目录进入下一级，文件预留后续操作"""
+        try:
+            payload = item.data(Qt.UserRole) or {}
+            isdir = int(payload.get('isdir') or 0)
+            path = payload.get('path') or '/'
+            if isdir == 1:
+                self.current_folder = path
+                self.load_files()
+            else:
+                QMessageBox.information(self, "文件", f"文件：{payload.get('server_filename') or payload.get('name')}")
+        except Exception as e:
+            QMessageBox.warning(self, "打开", f"失败：{e}")
     
     def upload_file(self):
         """上传文件对话框"""
-        if not self.api_client.is_logged_in():
-            reply = QMessageBox.question(
-                self, 
-                "需要登录", 
-                "上传文件需要先登录，是否现在登录？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes
-            )
-            if reply == QMessageBox.Yes:
-                self.show_my_info()
-            return
-        
-        # 选择文件
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, 
-            "选择要上传的文件", 
-            "", 
-            "所有文件 (*)"
-        )
-        
-        if not file_path:
-            return
-        
-        # 选择远程路径
-        remote_path, ok = QInputDialog.getText(
-            self, 
-            "上传设置", 
-            "请输入远程路径:", 
-            text="/"
-        )
-        
-        if not ok or not remote_path:
-            return
-        
-        # 显示进度对话框
-        self.loading_dialog.show()
-        self.loading_dialog.update_status("正在上传文件...", 0)
-        
-        # 调用上传API
-        result = self.api_client.upload_local_file(file_path, remote_path)
-        if result and result.get("status") == "ok":
-            self.loading_dialog.hide()
-            QMessageBox.information(self, "成功", "文件上传成功！")
-            self.load_files()  # 刷新文件列表
-        else:
-            self.loading_dialog.hide()
-            error_msg = result.get("error", "上传失败") if result else "网络连接失败"
-            QMessageBox.critical(self, "错误", f"上传失败: {error_msg}")
+        try:
+            if not self.api_client.is_logged_in():
+                reply = QMessageBox.question(
+                    self, 
+                    "需要登录", 
+                    "上传文件需要先登录，是否现在登录？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply == QMessageBox.Yes:
+                    self.show_my_info()
+                return
+            # 选择上传通道：公共资源 / 我的网盘（自定义对话框：中文按钮）
+            def _choose_scope():
+                dlg = QDialog(self)
+                dlg.setWindowTitle("选择上传通道")
+                dlg.setFixedSize(320, 140)
+                lay = QVBoxLayout(dlg)
+                tip = QLabel("请选择上传通道：")
+                lay.addWidget(tip)
+                from PySide6.QtWidgets import QComboBox
+                cmb = QComboBox(dlg)
+                cmb.addItems(["公共资源", "我的网盘"])
+                lay.addWidget(cmb)
+                btns = QHBoxLayout()
+                ok_btn = QPushButton("确定")
+                cancel_btn = QPushButton("取消")
+                btns.addStretch(1)
+                btns.addWidget(ok_btn)
+                btns.addWidget(cancel_btn)
+                lay.addLayout(btns)
+                ok_btn.clicked.connect(dlg.accept)
+                cancel_btn.clicked.connect(dlg.reject)
+                if dlg.exec() == QDialog.Accepted:
+                    return cmb.currentText()
+                return None
+            scope = _choose_scope()
+            if not scope:
+                return
+            is_public = (scope == "公共资源")
+
+            # 仅支持：本地文件上传
+            # 支持批量选择
+            paths, _ = QFileDialog.getOpenFileNames(self, "选择要上传的文件(可多选)", "", "所有文件 (*)")
+            if not paths:
+                return
+            # 过滤不存在
+            paths = [p for p in paths if os.path.exists(p)]
+            if not paths:
+                QMessageBox.warning(self, "上传", "所选文件均不存在")
+                return
+
+            # 异步批量上传
+            if is_public:
+                from ui.threads.upload_thread import UploadWorker
+                worker = UploadWorker(self.api_client, paths, is_public=True)
+                self.progress_bar.show()
+                self.status_label.setText("上传中...")
+                def _on_prog(text, done, total):
+                    self.status_label.setText(f"{text} ({done}/{total})")
+                def _on_finished(okc, failc, skipc):
+                    self.progress_bar.hide()
+                    QMessageBox.information(self, "上传", f"成功 {okc} 个，失败 {failc} 个，已存在跳过 {skipc} 个")
+                    if okc and not self.in_public:
+                        self.load_files()
+                worker.progress.connect(_on_prog)
+                def _finish_and_cleanup(okc, failc, skipc):
+                    try:
+                        _on_finished(okc, failc, skipc)
+                    finally:
+                        try:
+                            self.active_upload_workers.remove(worker)
+                        except Exception:
+                            pass
+                        worker.deleteLater()
+                worker.finished.connect(_finish_and_cleanup)
+                self.active_upload_workers.append(worker)
+                worker.start()
+            else:
+                # 我的网盘：从根目录开始加载目录，供用户选择
+                def _choose_user_dir(start_dir: str = "/"):
+                    dlg = QDialog(self)
+                    dlg.setWindowTitle("选择保存目录（我的网盘）")
+                    dlg.setFixedSize(480, 520)
+                    lay = QVBoxLayout(dlg)
+                    path_label = QLabel(start_dir)
+                    path_label.setStyleSheet("font-weight:bold;color:#1976D2;")
+                    lay.addWidget(path_label)
+                    lst = QListWidget()
+                    lay.addWidget(lst)
+                    btns = QHBoxLayout()
+                    btn_up = QPushButton("上级")
+                    btn_ok = QPushButton("选择此目录")
+                    btn_cancel = QPushButton("取消")
+                    btns.addWidget(btn_up)
+                    btns.addStretch(1)
+                    btns.addWidget(btn_ok)
+                    btns.addWidget(btn_cancel)
+                    lay.addLayout(btns)
+
+                    current_dir = {"path": start_dir}
+
+                    def _load(dir_path: str):
+                        path_label.setText(dir_path)
+                        lst.clear()
+                        # 加载该目录下的子目录
+                        result = self.api_client.list_files(dir_path, 1000)
+                        items = []
+                        if isinstance(result, dict):
+                            data = result.get("data") if isinstance(result.get("data"), dict) else result
+                            files = (data or {}).get("list") or (data or {}).get("files") or []
+                            items = [it for it in files if int(it.get('isdir') or 0) == 1]
+                        for it in items:
+                            name = it.get('server_filename') or it.get('file_name') or it.get('name') or ''
+                            item = QListWidgetItem(f"[目录] {name}")
+                            item.setData(Qt.UserRole, it)
+                            lst.addItem(item)
+
+                    def _enter():
+                        it = lst.currentItem()
+                        if not it:
+                            return
+                        payload = it.data(Qt.UserRole) or {}
+                        next_path = payload.get('path') or (current_dir['path'].rstrip('/') + '/' + (payload.get('server_filename') or ''))
+                        current_dir['path'] = next_path
+                        _load(current_dir['path'])
+
+                    def _up():
+                        p = current_dir['path']
+                        if p == '/' or not p:
+                            return
+                        parent = p.rstrip('/')
+                        parent = parent[:parent.rfind('/')] or '/'
+                        current_dir['path'] = parent
+                        _load(current_dir['path'])
+
+                    lst.itemDoubleClicked.connect(lambda _: _enter())
+                    btn_up.clicked.connect(_up)
+                    btn_ok.clicked.connect(dlg.accept)
+                    btn_cancel.clicked.connect(dlg.reject)
+
+                    _load(current_dir['path'])
+                    if dlg.exec() == QDialog.Accepted:
+                        return current_dir['path'] or '/'
+                    return None
+
+                dir_path = _choose_user_dir("/")
+                if not dir_path:
+                    return
+                from ui.threads.upload_thread import UploadWorker
+                worker = UploadWorker(self.api_client, paths, is_public=False, user_dir=dir_path)
+                self.progress_bar.show()
+                self.status_label.setText("上传中...")
+                def _on_prog(text, done, total):
+                    self.status_label.setText(f"{text} ({done}/{total})")
+                def _on_finished(okc, failc, skipc):
+                    self.progress_bar.hide()
+                    QMessageBox.information(self, "上传", f"成功 {okc} 个，失败 {failc} 个，已存在跳过 {skipc} 个")
+                    if okc and not self.in_public:
+                        self.load_files()
+                worker.progress.connect(_on_prog)
+                def _finish_and_cleanup2(okc, failc, skipc):
+                    try:
+                        _on_finished(okc, failc, skipc)
+                    finally:
+                        try:
+                            self.active_upload_workers.remove(worker)
+                        except Exception:
+                            pass
+                        worker.deleteLater()
+                worker.finished.connect(_finish_and_cleanup2)
+                self.active_upload_workers.append(worker)
+                worker.start()
+        except Exception as e:
+            QMessageBox.warning(self, "上传", f"失败：{e}")
     
     def open_public_resources(self):
         """打开公共资源页（在主内容区加载）"""
@@ -785,6 +1085,12 @@ class FileManagerUI(QMainWindow):
         self.public_has_more = True
         self.public_loading = False
         self.status_label.setText("公共资源：加载中...")
+        # 视图切换：显示树表，隐藏图标网格
+        try:
+            self.file_tree.show()
+            self.icon_grid.hide()
+        except Exception:
+            pass
         # 清空并加载第一页
         try:
             self.display_public_files([], append=False)
@@ -1007,6 +1313,81 @@ class FileManagerUI(QMainWindow):
             name_item = model.item(row, 0)
             payload = name_item.data(Qt.UserRole) if name_item else {}
             fs_id = payload.get('fs_id')
+            # 阅读列索引4：下载到临时目录并用系统默认程序打开
+            if col == 4:
+                if not fs_id:
+                    QMessageBox.warning(self, "阅读", "无法获取fs_id")
+                    return
+                import tempfile
+                def _get_meta():
+                    resp = self.api_client.public_download_links([int(fs_id)])
+                    if not isinstance(resp, dict) or resp.get('status') != 'ok':
+                        raise RuntimeError((resp.get('data') or {}).get('errmsg') or resp.get('error') or '未知错误')
+                    data = resp.get('data') or {}
+                    items = data.get('list') or []
+                    if not items:
+                        raise RuntimeError('未获取到直链元信息')
+                    return items[0]
+                def _get_ticket():
+                    t = self.api_client.public_download_ticket(fsid=fs_id, ttl=300)
+                    if not isinstance(t, dict) or t.get('status') != 'ok':
+                        raise RuntimeError((t.get('data') or {}).get('errmsg') or t.get('error') or '票据获取失败')
+                    tk = (t.get('data') or {}).get('ticket')
+                    if not tk:
+                        raise RuntimeError('票据为空')
+                    return tk
+                try:
+                    self.status_label.setText("阅读：准备中...")
+                    meta = _get_meta()
+                    real_name = meta.get('filename') or meta.get('server_filename') or (payload.get('file_name') or 'preview.bin')
+                    # 保存到临时目录
+                    tmp_dir = tempfile.gettempdir()
+                    base = self.api_client.base_url.rstrip('/')
+                    save_path = os.path.join(tmp_dir, real_name)
+                    tmp_path = save_path + '.part'
+                    size_expect = meta.get('size')
+                    ticket = _get_ticket()
+                    app_jwt = getattr(self.api_client, 'user_jwt', None)
+                    # 启动下载线程
+                    self.progress_bar.show()
+                    self.status_label.setText("阅读：下载中...")
+                    self.download_worker = ProxyDownloadWorker(
+                        base_url=base,
+                        ticket=ticket,
+                        save_path=save_path,
+                        tmp_path=tmp_path,
+                        size_expect=size_expect,
+                        app_jwt=app_jwt,
+                        resume_pos=0,
+                        parent=self
+                    )
+                    def _on_finished(path):
+                        self.progress_bar.hide()
+                        self.status_label.setText("阅读：打开中...")
+                        try:
+                            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                            self.status_label.setText("阅读：已打开")
+                        except Exception as e:
+                            self.status_label.setText(f"阅读失败：{e}")
+                            QMessageBox.warning(self, "阅读", f"打开失败：{e}")
+                    def _on_failed(err):
+                        self.progress_bar.hide()
+                        # 限额友好提示
+                        msg = str(err)
+                        if '429' in msg or 'daily_quota_exceeded' in msg:
+                            self.status_label.setText("阅读失败：今日额度已用尽")
+                            QMessageBox.information(self, "阅读", "今日总额度已用尽，请明日再试或升级会员。")
+                        else:
+                            self.status_label.setText("阅读失败")
+                            QMessageBox.warning(self, "阅读", f"下载失败：{err}")
+                    self.download_worker.finished.connect(_on_finished)
+                    self.download_worker.failed.connect(lambda e: _on_failed(e))
+                    self.download_worker.start()
+                except Exception as e:
+                    self.progress_bar.hide()
+                    self.status_label.setText("阅读失败")
+                    QMessageBox.warning(self, "阅读", f"失败：{e}")
+                return
             # 下载列索引5
             if col == 5:
                 # 公共资源：票据+代理下载（服务态）改为异步线程
@@ -1096,8 +1477,13 @@ class FileManagerUI(QMainWindow):
                                 pass
                         self.progress_bar.hide()
                         self.public_downloading = False
-                        self.status_label.setText("下载失败")
-                        QMessageBox.warning(self, "下载", f"下载失败：{err}")
+                        # 限额友好提示
+                        if '429' in msg or 'daily_quota_exceeded' in msg:
+                            self.status_label.setText("下载失败：今日额度已用尽")
+                            QMessageBox.information(self, "下载", "今日总额度已用尽，请明日再试或升级会员。")
+                        else:
+                            self.status_label.setText("下载失败")
+                            QMessageBox.warning(self, "下载", f"下载失败：{err}")
 
                     self.download_worker.progress.connect(_on_progress)
                     self.download_worker.status.connect(_on_status)
@@ -1110,7 +1496,7 @@ class FileManagerUI(QMainWindow):
                     self.status_label.setText("下载失败")
                     QMessageBox.warning(self, "下载", f"下载失败：{e}")
                 return
-            # 分享列索引6
+            # 分享列索引6（保留原逻辑）
             if col == 6:
                 # 默认生成4位密码
                 import random, string
@@ -1150,7 +1536,39 @@ class FileManagerUI(QMainWindow):
                     err = None
                     if isinstance(resp, dict):
                         err = (resp.get('data') or {}).get('errmsg') or resp.get('error')
-                    QMessageBox.warning(self, "分享失败", err or "未知错误")
+                    # 限额友好提示
+                    if err and ('daily_quota_exceeded' in str(err)):
+                        QMessageBox.information(self, "分享", "今日总额度已用尽，请明日再试或升级会员。")
+                    else:
+                        QMessageBox.warning(self, "分享失败", err or "未知错误")
+                return
+            # 举报列索引7
+            if col == 7:
+                if not fs_id:
+                    QMessageBox.warning(self, "举报", "无法获取fs_id 作为 target")
+                    return
+                # 选择/输入原因（简单输入框，限制长度）
+                reason, ok = QInputDialog.getText(self, "举报", "请输入举报原因（简述）:", text="违规/侵权")
+                if not ok:
+                    return
+                reason = (reason or '').strip()
+                if len(reason) > 200:
+                    reason = reason[:200]
+                resp = self.api_client.public_report_submit(str(fs_id), reason)
+                if isinstance(resp, dict) and resp.get('status') == 'ok':
+                    data = resp.get('data') or {}
+                    count = data.get('count')
+                    QMessageBox.information(self, "举报", f"举报已提交，当前该目标累计 {count} 次")
+                else:
+                    err = (resp or {}).get('error') if isinstance(resp, dict) else '未知错误'
+                    if err and (('429' in str(err)) or ('report_daily_limit' in str(err))):
+                        QMessageBox.information(self, "举报", "今日举报次数已达上限，请明日再试")
+                    elif err and ('report_too_frequent' in str(err)):
+                        QMessageBox.information(self, "举报", "操作过于频繁，请稍后再试")
+                    elif err and ('not_logged_in' in str(err)):
+                        QMessageBox.information(self, "举报", "请先登录后再举报")
+                    else:
+                        QMessageBox.warning(self, "举报", err or "举报失败")
                 return
         except Exception as e:
             QMessageBox.warning(self, "操作", f"失败：{e}")
@@ -1223,7 +1641,6 @@ class FileManagerUI(QMainWindow):
                     ui_data = self.api_client.user_info
             if ui_data:
                 dialog.set_user_info(ui_data)
-            dialog.exec()
         else:
             # 未登录，显示登录对话框
             from ui.dialogs.login_dialog import LoginDialog
@@ -1236,8 +1653,41 @@ class FileManagerUI(QMainWindow):
         QMessageBox.information(self, "智能问答", "智能问答功能已移除业务逻辑，仅保留界面。")
 
     def show_context_menu(self, position):
-        """显示上下文菜单"""
-        QMessageBox.information(self, "上下文菜单", "右键菜单功能已移除业务逻辑，仅保留界面。")
+        """显示公共资源表格的右键菜单（阅读/下载/分享/举报）"""
+        try:
+            # 仅在公共资源模式下启用
+            if not self.in_public:
+                return
+            index = self.file_tree.indexAt(position)
+            if not index.isValid():
+                return
+            row = index.row()
+            model = self.file_tree.model()
+            if model is None:
+                return
+            menu = QMenu(self)
+            act_read = menu.addAction("阅读")
+            act_download = menu.addAction("下载")
+            act_share = menu.addAction("分享")
+            act_report = menu.addAction("举报")
+            global_pos = self.file_tree.viewport().mapToGlobal(position)
+            action = menu.exec(global_pos)
+            if action is None:
+                return
+            # 映射到现有单元格点击逻辑：4=阅读,5=下载,6=分享,7=举报
+            if action == act_read:
+                self.on_public_cell_clicked(model.index(row, 4))
+            elif action == act_download:
+                self.on_public_cell_clicked(model.index(row, 5))
+            elif action == act_share:
+                self.on_public_cell_clicked(model.index(row, 6))
+            elif action == act_report:
+                self.on_public_cell_clicked(model.index(row, 7))
+        except Exception as e:
+            try:
+                QMessageBox.warning(self, "菜单", f"操作失败：{e}")
+            except Exception:
+                pass
     
     def check_scroll_position(self, value):
         """检查滚动位置，到底时加载更多"""
