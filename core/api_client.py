@@ -33,6 +33,7 @@ class APIClient(QObject):
         super().__init__()
         self.base_url = base_url
         self.user_jwt: Optional[str] = None
+        self.refresh_token_value: Optional[str] = None
         self.baidu_token: Optional[Dict[str, Any]] = None
         self.session = requests.Session()
         self.device_fingerprint = self.generate_device_fingerprint()
@@ -67,6 +68,7 @@ class APIClient(QObject):
         try:
             data = {
                 'jwt_token': jwt_token or self.user_jwt,
+                'refresh_token': self.refresh_token_value,
                 'baidu_token': baidu_token or self.baidu_token,
                 'user_info': user_info,
             }
@@ -99,6 +101,7 @@ class APIClient(QObject):
                         data = json.loads(encrypted_data)
                     
                     self.user_jwt = data.get('jwt_token') or None
+                    self.refresh_token_value = data.get('refresh_token') or None
                     self.baidu_token = data.get('baidu_token') or None
                     self.user_info = data.get('user_info') or None
         except Exception as e:
@@ -175,6 +178,7 @@ class APIClient(QObject):
             self.accounts = {}
         self.accounts[str(uk)] = {
             'jwt_token': jwt_token,
+            'refresh_token': self.refresh_token_value,
             'baidu_token': baidu_token,
             'user_info': user_info,
             'quota': quota or user_info.get('quota')
@@ -195,6 +199,7 @@ class APIClient(QObject):
         """应用指定账号的token和用户信息"""
         acct = self.accounts.get(str(uk)) or {}
         self.user_jwt = acct.get('jwt_token')
+        self.refresh_token_value = acct.get('refresh_token')
         self.baidu_token = acct.get('baidu_token')
         self.user_info = acct.get('user_info')
         if self.user_jwt:
@@ -299,11 +304,14 @@ class APIClient(QObject):
             if response.status_code == 200:
                 data = response.json()
                 self.user_jwt = data.get("access_token")
+                self.refresh_token_value = data.get("refresh_token")
                 if self.user_jwt:
                     # 更新请求头
                     self.session.headers.update({
                         'Authorization': f'Bearer {self.user_jwt}'
                     })
+                    # 保存token到本地
+                    self.save_tokens(self.user_jwt, self.baidu_token, getattr(self, 'user_info', None))
                     self.login_success.emit(data)
                     return True
             
@@ -375,10 +383,23 @@ class APIClient(QObject):
     def start_auto_qr_auth(self) -> Optional[Dict[str, Any]]:
         """启动自动扫码授权（无需登录）"""
         try:
+            # 使用端口8000
             response = self.session.post(f"{self.base_url}/oauth/device/start_auto")
+            print(f"[DEBUG] 启动自动授权状态码: {response.status_code}")
+            if response.content:
+                print(f"[DEBUG] 启动自动授权响应: {response.text[:200]}...")
+            
             if response.status_code == 200:
                 return response.json()
-            return None
+            else:
+                print(f"[DEBUG] 启动自动授权失败: HTTP {response.status_code}")
+                if response.content:
+                    try:
+                        error_data = response.json()
+                        print(f"[DEBUG] 错误详情: {error_data}")
+                    except:
+                        print(f"[DEBUG] 错误内容: {response.text}")
+                return None
         except Exception as e:
             print(f"启动自动授权失败: {e}")
             return None
@@ -407,6 +428,7 @@ class APIClient(QObject):
             if device_fingerprint:
                 params["device_fingerprint"] = device_fingerprint
                 
+            # 使用端口8000
             response = self.session.post(
                 f"{self.base_url}/oauth/device/poll_auto",
                 params=params
@@ -430,6 +452,19 @@ class APIClient(QObject):
             )
             if response.status_code == 200:
                 return response.json()
+            elif response.status_code in [401, 403]:
+                # Token过期，尝试刷新
+                print(f"[DEBUG] API调用失败 (HTTP {response.status_code})，尝试刷新token...")
+                if self.refresh_token():
+                    # 刷新成功，重试请求
+                    response = self.session.post(
+                        f"{self.base_url}/mcp/user/exec",
+                        json={"op": operation, "args": args or {}}
+                    )
+                    if response.status_code == 200:
+                        return response.json()
+                    else:
+                        print(f"[DEBUG] 重试后仍然失败: HTTP {response.status_code}")
             return None
         except Exception as e:
             print(f"API调用失败: {e}")
@@ -685,6 +720,69 @@ class APIClient(QObject):
         """检查是否已登录"""
         return self.user_jwt is not None
     
+    def refresh_token(self) -> bool:
+        """刷新JWT token"""
+        if not self.refresh_token_value:
+            print("[DEBUG] 无refresh_token，无法刷新")
+            return False
+        
+        try:
+            # 使用刷新接口
+            refresh_url = f"{self.base_url}/auth/refresh"
+            headers = {
+                'Content-Type': 'application/json'
+            }
+            
+            # 发送POST请求，包含refresh_token
+            response = self.session.post(refresh_url, json={"refresh_token": self.refresh_token_value}, headers=headers, timeout=10)
+            
+            print(f"[DEBUG] 刷新请求状态码: {response.status_code}")
+            if response.content:
+                print(f"[DEBUG] 刷新响应内容: {response.text[:200]}...")
+            
+            if response.status_code == 200:
+                data = response.json()
+                new_token = data.get("access_token") or data.get("token")
+                new_refresh_token = data.get("refresh_token")
+                if new_token:
+                    # 更新token
+                    self.user_jwt = new_token
+                    if new_refresh_token:
+                        self.refresh_token_value = new_refresh_token
+                    self.session.headers.update({'Authorization': f'Bearer {self.user_jwt}'})
+                    
+                    # 保存到本地
+                    self.save_tokens(self.user_jwt, self.baidu_token, getattr(self, 'user_info', None))
+                    
+                    # 更新当前账号的token
+                    if hasattr(self, 'current_account_uk') and self.current_account_uk:
+                        uk = self.current_account_uk
+                        if hasattr(self, 'accounts') and uk in self.accounts:
+                            self.accounts[uk]['jwt_token'] = new_token
+                            if new_refresh_token:
+                                self.accounts[uk]['refresh_token'] = new_refresh_token
+                            self.save_accounts()
+                    
+                    print(f"[DEBUG] Token刷新成功: {new_token[:20]}...")
+                    return True
+                else:
+                    print("[DEBUG] Token刷新失败: 响应中无access_token")
+                    print(f"[DEBUG] 响应数据: {data}")
+                    return False
+            else:
+                print(f"[DEBUG] Token刷新失败: HTTP {response.status_code}")
+                if response.content:
+                    try:
+                        error_data = response.json()
+                        print(f"[DEBUG] 错误详情: {error_data}")
+                    except:
+                        print(f"[DEBUG] 错误内容: {response.text}")
+                return False
+                
+        except Exception as e:
+            print(f"[DEBUG] Token刷新异常: {e}")
+            return False
+    
     def logout(self):
         """登出：清除内存与本地token"""
         self.user_jwt = None
@@ -724,10 +822,21 @@ class APIClient(QObject):
             params['order_desc'] = int(bool(order_desc))
         try:
             url = f"{self.base_url}/files/list"
-            headers = {}
-            if self.user_jwt:
-                headers['Authorization'] = f'Bearer {self.user_jwt}'
-            resp = self.session.get(url, params=params, headers=headers)
+            # 使用session的全局headers，确保JWT token正确传递
+            resp = self.session.get(url, params=params, timeout=10)
+            
+            # 添加调试信息
+            print(f"[DEBUG] files_list响应状态码: {resp.status_code}")
+            if resp.content:
+                print(f"[DEBUG] files_list响应内容: {resp.text[:200]}...")
+            
+            # 检查是否需要刷新token（仅401/403错误）
+            if resp.status_code in [401, 403] and self.user_jwt:
+                print(f"[DEBUG] files_list失败 (HTTP {resp.status_code})，尝试刷新token...")
+                if self.refresh_token():
+                    # 刷新成功，重试请求（使用更新后的全局headers）
+                    resp = self.session.get(url, params=params, timeout=10)
+            
             return resp.json() if resp.content else None
         except Exception as e:
             print(f"files_list失败: {e}")
@@ -736,10 +845,16 @@ class APIClient(QObject):
     def files_stats(self):
         try:
             url = f"{self.base_url}/files/stats"
-            headers = {}
-            if self.user_jwt:
-                headers['Authorization'] = f'Bearer {self.user_jwt}'
-            resp = self.session.get(url, headers=headers)
+            # 使用session的全局headers，确保JWT token正确传递
+            resp = self.session.get(url, timeout=10)
+            
+            # 检查是否需要刷新token（仅401/403错误）
+            if resp.status_code in [401, 403] and self.user_jwt:
+                print(f"[DEBUG] files_stats失败 (HTTP {resp.status_code})，尝试刷新token...")
+                if self.refresh_token():
+                    # 刷新成功，重试请求（使用更新后的全局headers）
+                    resp = self.session.get(url, timeout=10)
+            
             return resp.json() if resp.content else None
         except Exception as e:
             print(f"files_stats失败: {e}")

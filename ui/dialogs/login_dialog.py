@@ -346,11 +346,13 @@ class LoginDialog(QDialog):
             finally:
                 self.auth_thread = None
         
-        # 异步关闭对话框，避免与当前槽冲突
+        # 立即关闭对话框
+        print("[DEBUG] 登录对话框: 准备关闭对话框")
         try:
             from PySide6.QtCore import QTimer
-            QTimer.singleShot(0, self.accept)
-        except Exception:
+            QTimer.singleShot(100, self.accept)  # 增加延迟确保信号发送完成
+        except Exception as e:
+            print(f"[DEBUG] 登录对话框: 关闭对话框异常: {e}")
             self.accept()
     
     def check_and_emit_success(self, token_data):
@@ -359,6 +361,14 @@ class LoginDialog(QDialog):
         if jwt_token and self.api_client.user_jwt == jwt_token:
             print(f"[DEBUG] 登录对话框: JWT token设置完成，发送成功信号")
             self.login_success.emit(token_data)
+            # 发送信号后立即关闭对话框
+            print("[DEBUG] 登录对话框: 延迟检查后准备关闭对话框")
+            try:
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(100, self.accept)
+            except Exception as e:
+                print(f"[DEBUG] 登录对话框: 延迟关闭对话框异常: {e}")
+                self.accept()
         else:
             print(f"[DEBUG] 登录对话框: JWT token仍未设置，重试...")
             # 再次等待

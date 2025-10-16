@@ -100,12 +100,15 @@ class AutoAuthThread(QThread):
                         print("[AUTH SUCCESS]", result)
                     # 自动授权成功，设置JWT token
                     jwt_token = result.get("jwt_token")
+                    refresh_token = result.get("refresh_token")
                     baidu_token = result.get("baidu_token")
                     user_info = result.get("user_info")
                     
                     if jwt_token:
                         self.api_client.user_jwt = jwt_token
                         self.api_client.session.headers.update({'Authorization': f'Bearer {self.api_client.user_jwt}'})
+                    if refresh_token:
+                        self.api_client.refresh_token_value = refresh_token
                     if baidu_token:
                         self.api_client.baidu_token = baidu_token
                     if user_info:
@@ -114,6 +117,8 @@ class AutoAuthThread(QThread):
                         # 多账号保存与切换
                         uk = str(user_info.get('uk')) if user_info else None
                         if uk:
+                            # 先设置refresh_token，再保存账号
+                            self.api_client.refresh_token_value = refresh_token
                             self.api_client.save_account(uk, jwt_token, baidu_token, user_info)
                             self.api_client.set_current_account(uk)
                         # 兼容旧存储

@@ -62,13 +62,25 @@ class UserInfoDialog(QDialog):
             if avatar_url:
                 try:
                     import requests
-                    resp = requests.get(avatar_url, timeout=8)
+                    # 禁用代理，添加User-Agent，允许重定向
+                    headers = {"User-Agent": "PanClient/1.0.0"}
+                    resp = requests.get(
+                        avatar_url, 
+                        timeout=8,
+                        headers=headers,
+                        proxies={"http": None, "https": None},
+                        allow_redirects=True
+                    )
                     if resp.status_code == 200:
                         pix = QPixmap()
-                        pix.loadFromData(resp.content)
-                        self.avatar_label.setPixmap(pix.scaled(80, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                except Exception:
-                    pass
+                        if pix.loadFromData(resp.content):
+                            self.avatar_label.setPixmap(pix.scaled(80, 80, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                        else:
+                            print(f"[DEBUG] 头像图片格式不支持: {avatar_url}")
+                    else:
+                        print(f"[DEBUG] 头像请求失败: {resp.status_code}")
+                except Exception as e:
+                    print(f"[DEBUG] 头像加载异常: {e}")
         # 配额
         if self.quota_label:
             quota = self.user_info.get('quota') or {}
