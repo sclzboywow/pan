@@ -140,6 +140,9 @@ def main():
         print(f"使用 UPX 压缩: {upx_dir}")
     else:
         print("UPX 未找到，跳过压缩")
+        print("提示: 如需压缩，可手动下载UPX并添加到系统PATH")
+        print("下载地址: https://github.com/upx/upx/releases")
+        print("或使用其他压缩工具如7-Zip压缩最终exe文件")
     
     # 入口文件
     args.append("main.py")

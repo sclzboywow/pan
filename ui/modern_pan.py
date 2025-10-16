@@ -260,6 +260,9 @@ class FileManagerUI(QMainWindow):
         self.public_ui_inited = False
         self.public_downloading = False
         
+        # 用户态表格初始化标志，避免重复连接信号
+        self.user_ui_inited = False
+        
         # 初始化UI相关属性
         self.is_vip = True  # 默认为VIP用户体验，以便启用多选等功能
 
@@ -304,6 +307,68 @@ class FileManagerUI(QMainWindow):
         # 异步上传任务列表，避免线程被GC回收
         self.active_upload_workers = []
     
+    def _friendly_error(self, err_text: str, scene: str = "操作") -> str:
+        """将常见错误码转为更友好的中文提示。"""
+        t = (err_text or '').lower()
+        # 公共态配额
+        if 'daily_quota_exceeded' in t or 'http 429' in t or '429' in t:
+            return f"{scene}失败：今日公共资源配额已用尽，请明日再试；或者切换到‘我的网盘’在用户态继续{scene}。"
+        # 未登录
+        if 'not_logged_in' in t or 'login required' in t:
+            return f"{scene}失败：需要登录，请先登录后再试。"
+        # 用户态百度授权缺失
+        if 'user_baidu_token_missing' in t or 'user_not_authorized' in t:
+            return f"{scene}失败：需要完成百度网盘授权，请在‘我的信息’中扫码授权后重试。"
+        # 403/401 常见情况
+        if '403(31045)' in t or '31045' in t:
+            return f"{scene}失败：上游风控拦截（31045）。请稍后重试，或更换网络环境。"
+        if '31064' in t or 'file is not authorized' in t or 'failed check pr auth' in t:
+            return f"{scene}失败：文件受限（31064），上游未授权访问。可稍后重试，或切换到‘我的网盘’在用户态尝试{scene}。"
+        if '31326' in t:
+            return f"{scene}失败：上游风控（31326）。请稍后重试或更换网络环境。"
+        if 'http 403' in t or '403 forbidden' in t:
+            return f"{scene}失败：无权限或访问受限（403）。请稍后重试。"
+        if 'http 401' in t or 'unauthorized' in t:
+            return f"{scene}失败：登录已过期，请重新登录或稍后重试。"
+        # 网络与超时
+        if 'timeout' in t:
+            return f"{scene}失败：网络超时，请检查网络后再试。"
+        if 'failed to establish a new connection' in t or 'proxyerror' in t or 'connection' in t:
+            return f"{scene}失败：网络连接异常，请检查系统代理或网络设置后再试。"
+        # 其它
+        return f"{scene}失败：{err_text}"
+
+    def _ensure_mode(self, require_public: bool, scene: str = "操作") -> bool:
+        """确保当前处于期望态；不满足时提示并可一键切换。
+        返回 True 表示已在期望态；False 表示已触发切换或用户取消。
+        """
+        try:
+            if require_public and not self.in_public:
+                reply = QMessageBox.question(
+                    self,
+                    "模式不匹配",
+                    f"当前在‘我的网盘’用户态，需在‘公共资源’完成{scene}。是否切换到公共资源？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply == QMessageBox.Yes:
+                    self.open_public_resources()
+                return False
+            if (not require_public) and self.in_public:
+                reply = QMessageBox.question(
+                    self,
+                    "模式不匹配",
+                    f"当前在‘公共资源’，需在‘我的网盘’完成{scene}。是否切换到我的网盘？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply == QMessageBox.Yes:
+                    self.go_home()
+                return False
+            return True
+        except Exception:
+            return require_public == self.in_public
+
     def setup_api_connections(self):
         """设置API客户端信号连接"""
         self.api_client.login_success.connect(self.on_login_success)
@@ -313,14 +378,14 @@ class FileManagerUI(QMainWindow):
         self.api_client.api_error.connect(self.on_api_error)
     
     def check_login_status_and_navigate(self):
-        """检查登录状态并导航到相应页面"""
+        """检查登录状态并导航到相应页面。
+        规则更新：程序默认进入公共态，无论是否已登录；用户可通过导航按钮在公共态与用户态间切换。
+        """
         if self.api_client.is_logged_in():
-            # 已登录，进入公共资源页面
-            print("[DEBUG] 用户已登录，进入公共资源页面")
+            print("[DEBUG] 用户已登录，默认进入公共资源页面")
             self.status_label.setText("已登录 - 公共资源")
             self.open_public_resources()
         else:
-            # 未登录，进入公共资源页面（演示模式）
             print("[DEBUG] 用户未登录，进入公共资源页面（演示模式）")
             self.status_label.setText("演示模式 - 点击用户信息进行登录")
             self.open_public_resources()
@@ -344,11 +409,15 @@ class FileManagerUI(QMainWindow):
         dialog.exec()
     
     def on_login_success(self, data):
-        """登录成功处理"""
-        print("[DEBUG] 登录成功，进入公共资源页面")
-        # 登录成功后进入公共资源页面
-        self.status_label.setText("已登录 - 公共资源")
-        self.open_public_resources()
+        """登录成功处理：保持当前视图（默认公共态），仅更新状态栏"""
+        print("[DEBUG] 登录成功，保持当前视图")
+        try:
+            if self.in_public:
+                self.status_label.setText("已登录 - 公共资源")
+            else:
+                self.status_label.setText("已登录 - 我的网盘")
+        except Exception:
+            self.status_label.setText("已登录")
     
     def on_login_failed(self, error_msg):
         """登录失败处理"""
@@ -356,16 +425,16 @@ class FileManagerUI(QMainWindow):
         QMessageBox.critical(self, "错误", f"登录失败: {error_msg}")
     
     def on_auth_success(self, token_data):
-        """授权成功处理"""
+        """授权成功处理：保持当前视图（默认公共态），仅更新状态栏"""
         print(f"[DEBUG] on_auth_success: user_jwt={'exists' if self.api_client.user_jwt else 'None'}")
-        
-        # 授权成功后进入公共资源页面
-        self.status_label.setText("已登录 - 公共资源")
+        try:
+            if self.in_public:
+                self.status_label.setText("已登录 - 公共资源")
+            else:
+                self.status_label.setText("已登录 - 我的网盘")
+        except Exception:
+            self.status_label.setText("已登录")
         QMessageBox.information(self, "成功", "百度网盘授权成功！")
-        
-        # 延迟进入公共资源，确保状态完全更新
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(100, self.open_public_resources)
     
     def on_auth_failed(self, error_msg):
         """授权失败处理"""
@@ -378,7 +447,7 @@ class FileManagerUI(QMainWindow):
         QMessageBox.critical(self, "错误", f"API错误: {error_msg}")
     
     def load_files(self):
-        """加载文件列表"""
+        """加载文件列表（用户态：使用与公共态相同的表格布局）"""
         # 检查登录状态，添加调试信息
         is_logged_in = self.api_client.is_logged_in()
         user_jwt_info = f"exists (len={len(self.api_client.user_jwt)})" if self.api_client.user_jwt else 'None'
@@ -391,18 +460,11 @@ class FileManagerUI(QMainWindow):
             self.open_public_resources()
             return
         
-        # 确保从公共资源模式切换回用户态模型
+        # 切换为用户态并显示表格视图（与公共态一致的表头）
         self.in_public = False
         try:
-            if self.file_tree.model() is not self.model:
-                self.file_tree.setModel(self.model)
-        except Exception:
-            pass
-
-        # 视图切换：显示图标网格，隐藏公共树表
-        try:
-            self.icon_grid.show()
-            self.file_tree.hide()
+            self.file_tree.show()
+            self.icon_grid.hide()
         except Exception:
             pass
 
@@ -428,7 +490,7 @@ class FileManagerUI(QMainWindow):
 
         if ok_flag:
             try:
-                self.populate_icon_grid(files)
+                self.display_user_files(files, append=False)
                 try:
                     cur_path = self.current_folder or '/'
                     self.status_label.setText(f"用户态：{cur_path} 已加载 {len(files)} 项")
@@ -443,6 +505,453 @@ class FileManagerUI(QMainWindow):
             QMessageBox.critical(self, "错误", f"加载文件失败: {error_msg}")
         
         self.is_loading = False
+
+    def display_user_files(self, files, append: bool = False):
+        """在主列表控件内显示用户态文件列表，表格布局与公共态一致，但操作列改为“打开/下载/分享/删除”。"""
+        from PySide6.QtGui import QStandardItem, QStandardItemModel
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QColor, QBrush
+        try:
+            if not append:
+                model = QStandardItemModel()
+                model.setHorizontalHeaderLabels(["文件名称", "大小", "类别", "修改时间", "打开", "下载", "分享", "删除"])
+                self.file_tree.setModel(model)
+                try:
+                    model.horizontalHeaderItem(0).setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                    for col in range(1, 8):
+                        it = model.horizontalHeaderItem(col)
+                        if it:
+                            it.setTextAlignment(Qt.AlignCenter)
+                except Exception:
+                    pass
+                # 用户态动作点击：安全断开公共态槽，再连接用户态槽
+                try:
+                    self.file_tree.clicked.disconnect(self.on_public_cell_clicked)
+                except Exception:
+                    pass
+                try:
+                    self.file_tree.clicked.disconnect(self.on_user_cell_clicked)
+                except Exception:
+                    pass
+                self.file_tree.clicked.connect(self.on_user_cell_clicked)
+                self.user_ui_inited = True
+            else:
+                model = self.file_tree.model()
+                if model is None:
+                    model = QStandardItemModel()
+                    model.setHorizontalHeaderLabels(["文件名称", "大小", "类别", "修改时间", "打开", "下载", "分享", "删除"])
+                    self.file_tree.setModel(model)
+                # 确保信号连接一次
+                if not self.user_ui_inited:
+                    try:
+                        self.file_tree.clicked.disconnect(self.on_public_cell_clicked)
+                    except Exception:
+                        pass
+                    try:
+                        self.file_tree.clicked.disconnect(self.on_user_cell_clicked)
+                    except Exception:
+                        pass
+                    self.file_tree.clicked.connect(self.on_user_cell_clicked)
+                    self.user_ui_inited = True
+            for f in files:
+                name = f.get('server_filename') or f.get('file_name') or f.get('name') or ''
+                size = f.get('size') or f.get('file_size') or 0
+                is_dir = int(f.get('isdir') or 0) == 1
+                # 类型：文件夹或由后缀推断
+                type_text = self._user_file_type_text(f)
+                mtime = f.get('server_mtime') or f.get('mtime') or f.get('update_time') or f.get('ctime') or 0
+                # 路径：优先后端给出的path；否则用当前目录+文件名拼接
+                path_val = f.get('path') or f.get('server_path') or ''
+                if not path_val:
+                    try:
+                        base = self.current_folder or '/'
+                        if not base.endswith('/'):
+                            base = base + '/'
+                        path_val = base + name
+                    except Exception:
+                        path_val = '/' + name
+                fs_id = f.get('fs_id') or f.get('fsid') or f.get('id')
+                try:
+                    if isinstance(mtime, (int, float)):
+                        mtime_str = datetime.fromtimestamp(float(mtime)).strftime('%Y-%m-%d %H:%M')
+                    else:
+                        mtime_str = str(mtime)
+                except Exception:
+                    mtime_str = "-"
+                name_item = QStandardItem(str(name))
+                name_item.setData({'path': path_val, 'raw': f, 'fsid': fs_id}, Qt.UserRole)
+                size_item = QStandardItem("-" if is_dir else self.format_size(float(size)))
+                cat_item = QStandardItem(type_text)
+                time_item = QStandardItem(mtime_str)
+                open_item = QStandardItem("打开")
+                download_item = QStandardItem("下载")
+                share_item = QStandardItem("分享")
+                delete_item = QStandardItem("删除")
+                for it in (size_item, cat_item, time_item, open_item, download_item, share_item, delete_item):
+                    it.setTextAlignment(Qt.AlignCenter)
+                open_item.setForeground(QBrush(QColor("#333333")))
+                download_item.setForeground(QBrush(QColor("#2E86AB")))
+                share_item.setForeground(QBrush(QColor("#FF9F43")))
+                delete_item.setForeground(QBrush(QColor("#E74C3C")))
+                model.appendRow([name_item, size_item, cat_item, time_item, open_item, download_item, share_item, delete_item])
+            try:
+                self.file_tree.setColumnWidth(0, 480)
+                self.file_tree.setColumnWidth(1, 100)
+                self.file_tree.setColumnWidth(2, 80)
+                self.file_tree.setColumnWidth(3, 150)
+                self.file_tree.setColumnWidth(4, 60)
+                self.file_tree.setColumnWidth(5, 60)
+                self.file_tree.setColumnWidth(6, 60)
+                self.file_tree.setColumnWidth(7, 60)
+            except Exception:
+                pass
+        except Exception as e:
+            QMessageBox.warning(self, "我的网盘", f"显示失败：{e}")
+
+    def _user_file_type_text(self, file_info) -> str:
+        """用户态类型显示：文件夹或根据文件后缀推断类型标签。"""
+        try:
+            if int(file_info.get('isdir') or 0) == 1:
+                return "文件夹"
+            name = (file_info.get('server_filename') or file_info.get('file_name') or file_info.get('name') or '').lower()
+            from pathlib import Path
+            ext = Path(name).suffix.lstrip('.')
+            if not ext:
+                return "文件"
+            image_ext = {"jpg","jpeg","png","gif","bmp","webp","svg"}
+            video_ext = {"mp4","mkv","avi","mov","flv","wmv","m4v"}
+            audio_ext = {"mp3","wav","flac","aac","ogg","ape","m4a"}
+            doc_pdf = {"pdf"}
+            doc_word = {"doc","docx"}
+            doc_excel = {"xls","xlsx","csv"}
+            doc_ppt = {"ppt","pptx"}
+            doc_text = {"txt","md","rtf","json","xml","html","htm"}
+            archive_ext = {"zip","rar","7z","tar","gz","bz2","iso"}
+            code_ext = {"py","js","ts","java","go","c","cpp","cs","php","rb","rs"}
+            if ext in image_ext:
+                return "图片"
+            if ext in video_ext:
+                return "视频"
+            if ext in audio_ext:
+                return "音频"
+            if ext in doc_pdf:
+                return "PDF"
+            if ext in doc_word:
+                return "Word"
+            if ext in doc_excel:
+                return "Excel"
+            if ext in doc_ppt:
+                return "PPT"
+            if ext in doc_text:
+                return "文本"
+            if ext in archive_ext:
+                return "压缩包"
+            if ext in code_ext:
+                return "代码"
+            return ext.upper()
+        except Exception:
+            return "文件"
+
+    def on_user_cell_clicked(self, index):
+        """处理用户态表格的单元格点击（打开/下载/分享/删除）"""
+        try:
+            # 进入用户态事件处理上下文，防止标志位不同步
+            self.in_public = False
+            # 态校验：必须在用户态
+            if not self._ensure_mode(False, "网盘操作"):
+                return
+            if not index.isValid():
+                return
+            row = index.row()
+            col = index.column()
+            model = self.file_tree.model()
+            name_item = model.item(row, 0)
+            payload = name_item.data(Qt.UserRole) if name_item else {}
+            file_raw = (payload or {}).get('raw') or {}
+            # 若 file_raw 缺失 fsid，则尝试从 payload.fsid 或公共列推断
+            if not file_raw.get('fs_id') and not file_raw.get('fsid'):
+                try:
+                    fsid_guess = payload.get('fsid')
+                    if fsid_guess:
+                        file_raw['fsid'] = fsid_guess
+                except Exception:
+                    pass
+            is_dir = int(file_raw.get('isdir') or 0) == 1
+            path_val = payload.get('path') or '/'
+            # 打开
+            if col == 4:
+                if is_dir:
+                    self.current_folder = path_val
+                    self.load_files()
+                else:
+                    self.open_file_preview(file_raw)
+                return
+            # 下载
+            if col == 5:
+                self.download_user_file(file_raw)
+                return
+            # 分享
+            if col == 6:
+                self.share_user_file(file_raw)
+                return
+            # 删除
+            if col == 7:
+                self.delete_user_item(file_raw, row)
+                return
+        except Exception as e:
+            QMessageBox.warning(self, "我的网盘", f"操作失败：{e}")
+
+    def open_file_preview(self, file_info: dict):
+        """用户态：临时下载后用系统默认程序打开（小文件适用）。"""
+        try:
+            if int(file_info.get('isdir') or 0) == 1:
+                return
+            # 改为后端签票 + 代理下载再打开
+            import tempfile, os
+            from PySide6.QtGui import QDesktopServices
+            from PySide6.QtCore import QUrl
+            filename = file_info.get('server_filename') or file_info.get('file_name') or 'preview.bin'
+            tmp_path = os.path.join(tempfile.gettempdir(), filename)
+            fsid = file_info.get('fs_id') or file_info.get('fsid')
+            path_val = file_info.get('path') or file_info.get('server_path')
+            # 调试输出
+            try:
+                print(f"[DEBUG][USER][OPEN] fsid={fsid}, path={path_val}")
+            except Exception:
+                pass
+            self._proxy_download_to_path(fsid=fsid, path=path_val, save_path=tmp_path, ttl=300)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(tmp_path))
+        except Exception as e:
+            QMessageBox.warning(self, "打开", f"打开失败：{e}")
+
+    def download_user_file(self, file_info: dict):
+        """用户态：下载到本地目录（简化为直链直接下载）。"""
+        try:
+            if int(file_info.get('isdir') or 0) == 1:
+                QMessageBox.information(self, "下载", "文件夹下载请在右键菜单中使用打包下载（待实现）。")
+                return
+            from PySide6.QtWidgets import QFileDialog
+            save_dir = QFileDialog.getExistingDirectory(self, "选择保存目录")
+            if not save_dir:
+                return
+            import os
+            filename = file_info.get('server_filename') or file_info.get('file_name') or 'download.bin'
+            save_path = os.path.join(save_dir, filename)
+            fsid = file_info.get('fs_id') or file_info.get('fsid')
+            path_val = file_info.get('path') or file_info.get('server_path')
+            try:
+                print(f"[DEBUG][USER][DL] fsid={fsid}, path={path_val}, save={save_path}")
+            except Exception:
+                pass
+            self._proxy_download_to_path(fsid=fsid, path=path_val, save_path=save_path, ttl=600)
+            QMessageBox.information(self, "下载", f"已保存到：{save_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "下载", f"下载失败：{e}")
+
+    def _resolve_user_dlink(self, file_info: dict, expires_hint: int = 300) -> str:
+        """多策略获取用户态直链，返回可下载URL或抛出包含详细信息的异常。"""
+        try:
+            # 预处理标识
+            fsid = file_info.get('fs_id') or file_info.get('fsid') or file_info.get('id')
+            name = file_info.get('server_filename') or file_info.get('file_name') or file_info.get('name') or ''
+            path_val = file_info.get('path') or file_info.get('server_path') or ''
+            if not path_val and name:
+                base = self.current_folder or '/'
+                if not base.endswith('/'):
+                    base += '/'
+                path_val = base + name
+            # 尝试1：fsid 优先
+            if fsid:
+                resp = self.api_client.user_download_link(fsid=str(fsid), expires_hint=expires_hint)
+                if isinstance(resp, dict):
+                    data = resp.get('data') or {}
+                    dlink = data.get('dlink') or resp.get('dlink')
+                    if dlink:
+                        return dlink
+                    # 记录错误信息
+                    err = (data.get('errmsg') or data.get('error') or resp.get('error'))
+                    if err:
+                        print(f"[DEBUG] fsid直链失败: {err}")
+            # 尝试2：path
+            if path_val:
+                resp2 = self.api_client.user_download_link(path=path_val, expires_hint=expires_hint)
+                if isinstance(resp2, dict):
+                    data2 = resp2.get('data') or {}
+                    dlink2 = data2.get('dlink') or resp2.get('dlink')
+                    if dlink2:
+                        return dlink2
+                    err2 = (data2.get('errmsg') or data2.get('error') or resp2.get('error'))
+                    if err2:
+                        print(f"[DEBUG] path直链失败: {err2}")
+            # 尝试3：批量接口
+            if fsid:
+                resp3 = self.api_client.user_download_links([fsid])
+                if isinstance(resp3, dict):
+                    data3 = resp3.get('data') or {}
+                    items = data3.get('list') or data3.get('items') or []
+                    if items:
+                        d = items[0]
+                        dlink3 = d.get('dlink') or d.get('url')
+                        if dlink3:
+                            return dlink3
+                    err3 = (data3.get('errmsg') or resp3.get('error'))
+                    if err3:
+                        print(f"[DEBUG] 批量直链失败: {err3}")
+            raise RuntimeError('获取直链失败')
+        except Exception as e:
+            raise
+
+    def _proxy_download_to_path(self, fsid=None, save_path: str = None, ttl: int = 300, path: str = None):
+        """通过后端签票 + 代理下载到本地；统一处理403、31045与用户百度token缺失提示。
+        支持断点续传：若已存在同名文件，则从其大小处继续下载。
+        """
+        import requests
+        # 先签票
+        def sign_ticket() -> str:
+            if not (fsid or path):
+                raise RuntimeError('缺少fsid/path')
+            tk = self.api_client.user_download_ticket(fsid=fsid if fsid else None, path=path if path else None, ttl=ttl)
+            if not isinstance(tk, dict):
+                raise RuntimeError('签票响应异常')
+            if str(tk.get('status')).lower() != 'ok':
+                data = tk.get('data') or {}
+                err = tk.get('error') or data.get('error') or data.get('errmsg') or ''
+                # 后端约定：未授权或用户token缺失
+                if err in ('user_baidu_token_missing', 'user_not_authorized'):
+                    raise RuntimeError('需要扫码授权，请在“用户信息”中重新授权后重试')
+                # 透传百度errno
+                be = data.get('baidu_errno') or data.get('errno')
+                if be is not None:
+                    raise RuntimeError(f"百度错误 errno={be}")
+                raise RuntimeError(err or '签票失败')
+            # 兼容 ticket 位置
+            ticket = tk.get('ticket') or (tk.get('data') or {}).get('ticket') or ((tk.get('data') or {}).get('data') or {}).get('ticket')
+            if not ticket:
+                try:
+                    print(f"[DEBUG][USER][TICKET] empty ticket, raw={tk}")
+                except Exception:
+                    pass
+                raise RuntimeError('票据为空')
+            return ticket
+        def do_download(ticket: str):
+            base = self.api_client.base_url.rstrip('/')
+            url = f"{base}/files/proxy_download?ticket={ticket}"
+            headers = {"Authorization": f"Bearer {self.api_client.user_jwt}"}
+            # 断点支持：若文件已部分存在，从已有大小续传
+            resume_from = 0
+            try:
+                import os
+                if os.path.exists(save_path):
+                    resume_from = os.path.getsize(save_path)
+            except Exception:
+                resume_from = 0
+            if resume_from > 0:
+                headers['Range'] = f'bytes={resume_from}-'
+            r = requests.get(url, stream=True, timeout=60, headers=headers, proxies={"http": None, "https": None}, allow_redirects=True)
+            if r.status_code == 403:
+                # 尝试读取JSON体，检查errno 31045
+                errno = None
+                try:
+                    body = r.json()
+                    data_b = body.get('data') or {}
+                    errno = data_b.get('errno') or body.get('errno')
+                    msg = body.get('error') or body.get('message') or data_b.get('errmsg') or ''
+                except Exception:
+                    msg = r.text[:200]
+                if errno == 31045:
+                    raise RuntimeError('403(31045)')
+                raise RuntimeError(msg or '403 Forbidden')
+            # 非2xx（且非403）也尽量解析JSON错误体
+            if r.status_code not in (200, 206):
+                try:
+                    body = r.json()
+                    data_b = body.get('data') or {}
+                    msg = body.get('error') or body.get('message') or data_b.get('errmsg') or ''
+                except Exception:
+                    msg = r.text[:200]
+                raise RuntimeError(f"HTTP {r.status_code}: {msg}")
+            mode = 'ab' if resume_from > 0 else 'wb'
+            with open(save_path, mode) as f:
+                for chunk in r.iter_content(chunk_size=256*1024):
+                    if chunk:
+                        f.write(chunk)
+        # 流程：签票→下载；若下载报403(31045)或401/403，尝试刷新JWT后重签一次
+        try:
+            t1 = sign_ticket()
+            do_download(t1)
+        except Exception as e:
+            msg = str(e)
+            if '403' in msg or '401' in msg:
+                # 刷新JWT后重试一次（后端应使用用户token兜底，无服务态）
+                if self.api_client.refresh_token():
+                    t2 = sign_ticket()
+                    do_download(t2)
+                    return
+            # 其余错误直接抛出
+            raise
+
+    def share_user_file(self, file_info: dict):
+        """用户态：分享（占位，展示未实现或跳转公共分享逻辑）。"""
+        try:
+            QMessageBox.information(self, "分享", "用户态分享接口暂未开放，后续接入后端API后启用。")
+        except Exception as e:
+            QMessageBox.warning(self, "分享", f"分享失败：{e}")
+
+    def delete_user_item(self, file_info: dict, row: int = None):
+        """用户态：删除文件/目录（基于fs_id）。删除后轮询后端，直至条目消失或超时。"""
+        try:
+            fsid = file_info.get('fs_id') or file_info.get('fsid')
+            if not fsid:
+                raise RuntimeError('缺少fs_id')
+            ret = self.api_client.delete_file(str(fsid))
+            if isinstance(ret, dict) and (ret.get('status') in ('ok','success')):
+                # UI先行移除该行，随后轻量刷新
+                try:
+                    if row is not None:
+                        mdl = self.file_tree.model()
+                        if mdl:
+                            mdl.removeRow(row)
+                except Exception:
+                    pass
+                # 启动轮询确认（最多约10秒）
+                start_ts = time.time()
+                target_id = str(fsid)
+                disappeared = False
+                while time.time() - start_ts < 10:
+                    try:
+                        lst = self.api_client.list_files(self.current_folder, limit=200)
+                        items = []
+                        if isinstance(lst, dict):
+                            data = lst.get('data') or lst
+                            items = data.get('list') or data.get('files') or data.get('items') or []
+                        elif isinstance(lst, list):
+                            items = lst
+                        present = False
+                        for it in items:
+                            cur = str(it.get('fs_id') or it.get('fsid') or '')
+                            if cur and cur == target_id:
+                                present = True
+                                break
+                        if not present:
+                            disappeared = True
+                            break
+                        QApplication.processEvents()
+                        time.sleep(0.4)
+                    except Exception:
+                        break
+                # 最终刷新一次
+                from PySide6.QtCore import QTimer
+                QTimer.singleShot(100, self.load_files)
+                QMessageBox.information(self, "删除", "已删除" if disappeared else "已提交删除（后台处理可能稍有延迟）")
+            else:
+                err = ''
+                try:
+                    err = (ret or {}).get('error') or ((ret or {}).get('data') or {}).get('errmsg') or ''
+                except Exception:
+                    pass
+                raise RuntimeError(err or '删除失败')
+        except Exception as e:
+            QMessageBox.warning(self, "删除", f"删除失败：{e}")
     
     def load_demo_files(self):
         """加载演示文件数据"""
@@ -934,14 +1443,11 @@ class FileManagerUI(QMainWindow):
 
     def go_home(self):
         """返回主页"""
-        # 切回用户态并加载网盘根目录
+        # 切回用户态并加载网盘根目录（表格视图，与公共态一致排版）
         self.in_public = False
         try:
-            if self.file_tree.model() is not self.model:
-                self.file_tree.setModel(self.model)
-            # 切换视图为图标网格
-            self.icon_grid.show()
-            self.file_tree.hide()
+            self.file_tree.show()
+            self.icon_grid.hide()
         except Exception:
             pass
         self.current_folder = '/'
@@ -1390,6 +1896,11 @@ class FileManagerUI(QMainWindow):
     def on_public_cell_clicked(self, index):
         """处理公共资源表格的单元格点击（分享/下载/阅读/举报）"""
         try:
+            # 进入公共态事件处理上下文，防止标志位不同步
+            self.in_public = True
+            # 态校验：必须在公共态
+            if not self._ensure_mode(True, "公共资源操作"):
+                return
             if not index.isValid():
                 return
             row = index.row()
@@ -1400,7 +1911,13 @@ class FileManagerUI(QMainWindow):
             fs_id = payload.get('fs_id')
             # 阅读列索引4：下载到临时目录并用系统默认程序打开
             if col == 4:
-                if not fs_id:
+                # 调试输出当前点击行的关键信息
+                try:
+                    print(f"[DEBUG][READ] payload={payload}")
+                    print(f"[DEBUG][READ] fs_id={fs_id}, path={payload.get('file_path') or payload.get('path')} ")
+                except Exception:
+                    pass
+                if not fs_id and not (payload.get('file_path') or payload.get('path')):
                     QMessageBox.warning(self, "阅读", "无法获取fs_id")
                     return
                 import tempfile
@@ -1414,13 +1931,48 @@ class FileManagerUI(QMainWindow):
                         raise RuntimeError('未获取到直链元信息')
                     return items[0]
                 def _get_ticket():
-                    t = self.api_client.public_download_ticket(fsid=fs_id, ttl=300)
-                    if not isinstance(t, dict) or t.get('status') != 'ok':
-                        raise RuntimeError((t.get('data') or {}).get('errmsg') or t.get('error') or '票据获取失败')
-                    tk = (t.get('data') or {}).get('ticket')
-                    if not tk:
-                        raise RuntimeError('票据为空')
-                    return tk
+                    # 优先 fsid，失败或空票据时，若存在 path 则回退用 path 再试一次
+                    def _extract_ticket(resp_dict):
+                        data1 = resp_dict.get('ticket')
+                        data2 = (resp_dict.get('data') or {}).get('ticket')
+                        data3 = ((resp_dict.get('data') or {}).get('data') or {}).get('ticket')
+                        return data1 or data2 or data3
+                    # 尝试 fsid
+                    t = self.api_client.public_download_ticket(fsid=fs_id, ttl=300) if fs_id else None
+                    if isinstance(t, dict):
+                        try:
+                            print(f"[DEBUG][READ] sign fsid status={t.get('status')} raw={t}")
+                        except Exception:
+                            pass
+                    if isinstance(t, dict) and str(t.get('status')).lower() == 'ok':
+                        tk = _extract_ticket(t)
+                        if tk:
+                            try:
+                                print(f"[DEBUG][READ] ticket(from fsid)={tk[:32]}...")
+                            except Exception:
+                                pass
+                            return tk
+                    # 回退 path
+                    p = payload.get('file_path') or payload.get('path')
+                    if p:
+                        t2 = self.api_client.public_download_ticket(path=p, ttl=300)
+                        if isinstance(t2, dict):
+                            try:
+                                print(f"[DEBUG][READ] sign path status={t2.get('status')} raw={t2}")
+                            except Exception:
+                                pass
+                        if isinstance(t2, dict) and str(t2.get('status')).lower() == 'ok':
+                            tk2 = _extract_ticket(t2)
+                            if tk2:
+                                try:
+                                    print(f"[DEBUG][READ] ticket(from path)={tk2[:32]}...  path={p}")
+                                except Exception:
+                                    pass
+                                return tk2
+                        err2 = (t2.get('data') or {}).get('errmsg') or t2.get('error') if isinstance(t2, dict) else None
+                        raise RuntimeError(err2 or '票据获取失败')
+                    err = (t.get('data') or {}).get('errmsg') or t.get('error') if isinstance(t, dict) else None
+                    raise RuntimeError(err or '票据获取失败')
                 try:
                     self.status_label.setText("阅读：准备中...")
                     meta = _get_meta()
@@ -1432,6 +1984,10 @@ class FileManagerUI(QMainWindow):
                     tmp_path = save_path + '.part'
                     size_expect = meta.get('size')
                     ticket = _get_ticket()
+                    try:
+                        print(f"[DEBUG][READ] final ticket={ticket[:48]}...  jwt_present={bool(app_jwt)}")
+                    except Exception:
+                        pass
                     app_jwt = getattr(self.api_client, 'user_jwt', None)
                     # 启动下载线程
                     self.progress_bar.show()
@@ -1470,13 +2026,18 @@ class FileManagerUI(QMainWindow):
                     self.download_worker.start()
                 except Exception as e:
                     self.progress_bar.hide()
+                    msg = self._friendly_error(str(e), "阅读")
                     self.status_label.setText("阅读失败")
-                    QMessageBox.warning(self, "阅读", f"失败：{e}")
+                    QMessageBox.information(self, "阅读", msg)
                 return
             # 下载列索引5
             if col == 5:
                 # 公共资源：票据+代理下载（服务态）改为异步线程
-                if not fs_id:
+                try:
+                    print(f"[DEBUG][DL] in_public={self.in_public}, payload={payload}")
+                except Exception:
+                    pass
+                if not fs_id and not (payload.get('file_path') or payload.get('path')):
                     QMessageBox.warning(self, "下载", "无法获取fs_id")
                     return
                 if self.public_downloading:
@@ -1495,13 +2056,38 @@ class FileManagerUI(QMainWindow):
                         raise RuntimeError('未获取到直链元信息')
                     return items[0]
                 def _get_ticket():
-                    t = self.api_client.public_download_ticket(fsid=fs_id, ttl=300)
-                    if not isinstance(t, dict) or t.get('status') != 'ok':
-                        raise RuntimeError((t.get('data') or {}).get('errmsg') or t.get('error') or '票据获取失败')
-                    tk = (t.get('data') or {}).get('ticket')
-                    if not tk:
-                        raise RuntimeError('票据为空')
-                    return tk
+                    # 优先 fsid，失败或空票据时，若存在 path 则回退用 path 再试一次
+                    def _extract_ticket(resp_dict):
+                        data1 = resp_dict.get('ticket')
+                        data2 = (resp_dict.get('data') or {}).get('ticket')
+                        data3 = ((resp_dict.get('data') or {}).get('data') or {}).get('ticket')
+                        return data1 or data2 or data3
+                    t = self.api_client.public_download_ticket(fsid=fs_id, ttl=300) if fs_id else None
+                    if isinstance(t, dict):
+                        try:
+                            print(f"[DEBUG][DL] sign fsid status={t.get('status')} raw={t}")
+                        except Exception:
+                            pass
+                    if isinstance(t, dict) and str(t.get('status')).lower() == 'ok':
+                        tk = _extract_ticket(t)
+                        if tk:
+                            return tk
+                    p = payload.get('file_path') or payload.get('path')
+                    if p:
+                        t2 = self.api_client.public_download_ticket(path=p, ttl=300)
+                        if isinstance(t2, dict):
+                            try:
+                                print(f"[DEBUG][DL] sign path status={t2.get('status')} raw={t2}")
+                            except Exception:
+                                pass
+                        if isinstance(t2, dict) and str(t2.get('status')).lower() == 'ok':
+                            tk2 = _extract_ticket(t2)
+                            if tk2:
+                                return tk2
+                        err2 = (t2.get('data') or {}).get('errmsg') or t2.get('error') if isinstance(t2, dict) else None
+                        raise RuntimeError(err2 or '票据获取失败')
+                    err = (t.get('data') or {}).get('errmsg') or t.get('error') if isinstance(t, dict) else None
+                    raise RuntimeError(err or '票据获取失败')
                 try:
                     self.public_downloading = True
                     meta = _get_meta()
@@ -1578,8 +2164,9 @@ class FileManagerUI(QMainWindow):
                 except Exception as e:
                     self.progress_bar.hide()
                     self.public_downloading = False
+                    msg = self._friendly_error(str(e), "下载")
                     self.status_label.setText("下载失败")
-                    QMessageBox.warning(self, "下载", f"下载失败：{e}")
+                    QMessageBox.information(self, "下载", msg)
                 return
             # 分享列索引6（保留原逻辑）
             if col == 6:
@@ -1738,11 +2325,44 @@ class FileManagerUI(QMainWindow):
         QMessageBox.information(self, "智能问答", "智能问答功能研发中。")
 
     def show_context_menu(self, position):
-        """显示公共资源表格的右键菜单（阅读/下载/分享/举报）"""
+        """显示右键菜单。
+        - 公共资源模式：阅读/下载/分享/举报
+        - 用户态模式：打开/刷新/新建文件夹/重命名/移动/复制/删除/上传
+        """
         try:
-            # 仅在公共资源模式下启用
-            if not self.in_public:
+            # 公共资源模式
+            if self.in_public:
+                index = self.file_tree.indexAt(position)
+                if not index.isValid():
+                    return
+                row = index.row()
+                model = self.file_tree.model()
+                if model is None:
+                    return
+                menu = QMenu(self)
+                act_read = menu.addAction("阅读")
+                act_download = menu.addAction("下载")
+                act_share = menu.addAction("分享")
+                act_report = menu.addAction("举报")
+                menu.addSeparator()
+                act_about = menu.addAction("关于")
+                global_pos = self.file_tree.viewport().mapToGlobal(position)
+                action = menu.exec(global_pos)
+                if action is None:
+                    return
+                if action == act_read:
+                    self.on_public_cell_clicked(model.index(row, 4))
+                elif action == act_download:
+                    self.on_public_cell_clicked(model.index(row, 5))
+                elif action == act_share:
+                    self.on_public_cell_clicked(model.index(row, 6))
+                elif action == act_report:
+                    self.on_public_cell_clicked(model.index(row, 7))
+                elif action == act_about:
+                    self.show_about()
                 return
+
+            # 用户态模式
             index = self.file_tree.indexAt(position)
             if not index.isValid():
                 return
@@ -1750,38 +2370,143 @@ class FileManagerUI(QMainWindow):
             model = self.file_tree.model()
             if model is None:
                 return
+            name_item = model.item(row, 0)
+            file_info = name_item.data(Qt.UserRole) if name_item else {}
+            fs_id = (file_info or {}).get('fs_id') or (file_info or {}).get('fsid') or (file_info or {}).get('id')
+
             menu = QMenu(self)
-            act_read = menu.addAction("阅读")
-            act_download = menu.addAction("下载")
-            act_share = menu.addAction("分享")
-            act_report = menu.addAction("举报")
-            
-            # 添加分隔线
+            act_open = menu.addAction("打开")
+            act_refresh = menu.addAction("刷新")
             menu.addSeparator()
-            
-            # 添加关于选项（放在最后）
-            act_about = menu.addAction("关于")
-            
+            act_new_folder = menu.addAction("新建文件夹")
+            act_rename = menu.addAction("重命名")
+            act_move = menu.addAction("移动到...")
+            act_copy = menu.addAction("复制到...")
+            act_delete = menu.addAction("删除")
+            menu.addSeparator()
+            act_upload_local = menu.addAction("上传本地文件...")
+            act_upload_text = menu.addAction("上传文本...")
+            act_upload_url = menu.addAction("通过URL上传...")
+
             global_pos = self.file_tree.viewport().mapToGlobal(position)
             action = menu.exec(global_pos)
             if action is None:
                 return
-            # 映射到现有单元格点击逻辑：4=阅读,5=下载,6=分享,7=举报
-            if action == act_read:
-                self.on_public_cell_clicked(model.index(row, 4))
-            elif action == act_download:
-                self.on_public_cell_clicked(model.index(row, 5))
-            elif action == act_share:
-                self.on_public_cell_clicked(model.index(row, 6))
-            elif action == act_report:
-                self.on_public_cell_clicked(model.index(row, 7))
-            elif action == act_about:
-                self.show_about()
+
+            if action == act_open:
+                QMessageBox.information(self, "打开", "打开功能即将支持。")
+                return
+            if action == act_refresh:
+                self.refresh_user_files()
+                return
+            if action == act_new_folder:
+                text, ok = QInputDialog.getText(self, "新建文件夹", "名称：")
+                if ok and text.strip():
+                    resp = self.api_client.create_folder(self.current_folder or '/', text.strip())
+                    self._show_result_msg(resp, "新建文件夹")
+                    self.refresh_user_files()
+                return
+            if action == act_rename:
+                if not fs_id:
+                    QMessageBox.warning(self, "重命名", "请选择一个文件/夹")
+                    return
+                new_name, ok = QInputDialog.getText(self, "重命名", "新名称：")
+                if ok and new_name.strip():
+                    resp = self.api_client.rename_file(str(fs_id), new_name.strip())
+                    self._show_result_msg(resp, "重命名")
+                    self.refresh_user_files()
+                return
+            if action == act_move:
+                if not fs_id:
+                    QMessageBox.warning(self, "移动", "请选择一个文件/夹")
+                    return
+                target, ok = QInputDialog.getText(self, "移动到", "目标目录：", text=self.current_folder or '/')
+                if ok and target.strip():
+                    resp = self.api_client.move_file(str(fs_id), target.strip())
+                    self._show_result_msg(resp, "移动")
+                    self.refresh_user_files()
+                return
+            if action == act_copy:
+                if not fs_id:
+                    QMessageBox.warning(self, "复制", "请选择一个文件/夹")
+                    return
+                target, ok = QInputDialog.getText(self, "复制到", "目标目录：", text=self.current_folder or '/')
+                if ok and target.strip():
+                    resp = self.api_client.copy_file(str(fs_id), target.strip())
+                    self._show_result_msg(resp, "复制")
+                    self.refresh_user_files()
+                return
+            if action == act_delete:
+                if not fs_id:
+                    QMessageBox.warning(self, "删除", "请选择一个文件/夹")
+                    return
+                if QMessageBox.question(self, "删除", "确定要删除所选项吗？", QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+                    resp = self.api_client.delete_file(str(fs_id))
+                    self._show_result_msg(resp, "删除")
+                    self.refresh_user_files()
+                return
+            if action == act_upload_local:
+                path = QFileDialog.getOpenFileName(self, "选择文件")[0]
+                if path:
+                    resp = self.api_client.upload_local_file(path, os.path.join(self.current_folder or '/', os.path.basename(path)))
+                    self._show_result_msg(resp, "上传文件")
+                    self.refresh_user_files()
+                return
+            if action == act_upload_text:
+                text, ok = QInputDialog.getMultiLineText(self, "上传文本", "内容：")
+                if ok and text:
+                    name, ok2 = QInputDialog.getText(self, "文件名", "例如 note.txt：", text="note.txt")
+                    if ok2 and name.strip():
+                        resp = self.api_client.upload_text_file(text, os.path.join(self.current_folder or '/', name.strip()))
+                        self._show_result_msg(resp, "上传文本")
+                        self.refresh_user_files()
+                return
+            if action == act_upload_url:
+                url, ok = QInputDialog.getText(self, "通过URL上传", "资源URL：")
+                if ok and url:
+                    name, ok2 = QInputDialog.getText(self, "保存为", "文件名：")
+                    if ok2 and name.strip():
+                        resp = self.api_client.user_upload_url(url.strip(), self.current_folder or '/', name.strip())
+                        self._show_result_msg(resp, "URL上传")
+                        self.refresh_user_files()
+                return
         except Exception as e:
             try:
                 QMessageBox.warning(self, "菜单", f"操作失败：{e}")
             except Exception:
                 pass
+
+    def _show_result_msg(self, resp, action_name: str):
+        """统一提示后端结果。"""
+        try:
+            ok = isinstance(resp, dict) and (resp.get('status') == 'ok' or resp.get('success') is True or resp.get('errno') in (0, '0'))
+            if ok:
+                self.status_label.setText(f"{action_name}成功")
+            else:
+                err = None
+                if isinstance(resp, dict):
+                    err = resp.get('error') or (resp.get('data') or {}).get('errmsg')
+                QMessageBox.warning(self, action_name, err or f"{action_name}失败")
+        except Exception:
+            pass
+
+    def refresh_user_files(self):
+        """刷新用户态当前目录文件列表。"""
+        try:
+            if not self.api_client.is_logged_in():
+                QMessageBox.information(self, "刷新", "请先登录")
+                return
+            result = self.api_client.list_files(self.current_folder or '/', limit=1000)
+            files = []
+            if isinstance(result, dict):
+                data = result.get('data') or {}
+                files = result.get('list') or result.get('files') or data.get('list') or data.get('files') or []
+            elif isinstance(result, list):
+                files = result
+            self.display_files(files, append=False)
+            self.status_label.setText("已刷新")
+        except Exception as e:
+            QMessageBox.warning(self, "刷新", f"失败：{e}")
     
     def check_scroll_position(self, value):
         """检查滚动位置，到底时加载更多"""
@@ -1803,15 +2528,158 @@ class FileManagerUI(QMainWindow):
     
     def load_more_files(self):
         """加载更多文件"""
-        QMessageBox.information(self, "加载更多", "加载更多功能已移除业务逻辑，仅保留界面。")
+        self.is_loading = True
+        self.status_label.setText("正在加载更多文件...")
+        self.current_page += 1
+        
+        try:
+            # 构造请求参数
+            params = {
+                'method': 'list',
+                'access_token': self.access_token,
+                'dir': self.current_folder,
+                'order': 'time',
+                'desc': 1,
+                'start': (self.current_page - 1) * self.page_size,
+                'limit': self.page_size
+            }
+            
+            # 调用百度网盘API
+            response = requests.get(
+                'https://pan.baidu.com/rest/2.0/xpan/file',
+                params=params
+            )
+            
+            result = response.json()
+            if result.get('errno') == 0:
+                files = result.get('list', [])
+                
+                # 如果返回的文件数小于页大小，说明没有更多数据了
+                if len(files) < self.page_size:
+                    self.has_more = False
+                    self.status_label.setText("已加载全部文件")
+                
+                # 添加新的文件到列表
+                if files:
+                    self.display_files(files, append=True)
+                    if self.has_more:
+                        self.status_label.setText(f"已加载第 {self.current_page} 页")
+                else:
+                    self.has_more = False
+                    self.status_label.setText("已加载全部文件")
+            else:
+                self.status_label.setText(f"加载失败：错误码 {result.get('errno')}")
+                
+        except Exception as e:
+            self.status_label.setText(f"加载失败：{str(e)}")
+        finally:
+            self.is_loading = False
 
     def download_selected_files(self):
-        """下载选中的文件"""
-        QMessageBox.information(self, "批量下载", "批量下载功能已移除业务逻辑，仅保留界面。")
+        """批量下载选择的文件"""
+        if not self.is_vip:
+            QMessageBox.warning(self, "提示", "批量下载功能仅对VIP用户开放")
+            return
 
-    def check_version(self):
-        """检查版本更新"""
-        QMessageBox.information(self, '版本检查', '版本检查功能已移除业务逻辑，仅保留界面。')
+        # 检查是否有正在进行的下载任务
+        if (self.download_worker and self.download_worker.isRunning()) or \
+           (hasattr(self, 'batch_download_worker') and self.batch_download_worker and self.batch_download_worker.isRunning()):
+            QMessageBox.warning(self, "提示", "有正在进行的下载任务，请等待当前下载完成。")
+            return
+
+        # 获取所有选中的项目
+        selected_indexes = self.file_tree.selectionModel().selectedRows()
+        if not selected_indexes:
+            QMessageBox.warning(self, "提示", "请先选择要下载的文件")
+            return
+
+        # 获取保存目录
+        save_dir = QFileDialog.getExistingDirectory(
+            self,
+            "选择保存目录",
+            "",
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+
+        if not save_dir:
+            return
+
+        try:
+            # 创建下载队列
+            download_queue = []
+            for index in selected_indexes:
+                file_info = self.model.item(index.row(), 0).data(Qt.UserRole)
+                if file_info:
+                    fs_id = file_info.get('fs_id')
+                    file_name = file_info.get('server_filename')
+                    if fs_id:
+                        save_path = os.path.join(save_dir, file_name)
+                        download_queue.append((fs_id, save_path, file_name))
+
+            if not download_queue:
+                return
+
+            # 显示进度条
+            self.progress_bar.show()
+            self.status_label.setText(f"准备下载 {len(download_queue)} 个文件...")
+
+            # 创建批量下载线程
+            self.batch_download_worker = BatchDownloadWorker(
+                self.access_token,
+                download_queue
+            )
+            self.batch_download_worker.progress.connect(self.update_batch_download_progress)
+            self.batch_download_worker.finished.connect(self.batch_download_finished)
+            self.batch_download_worker.start()
+
+        except Exception as e:
+            self.status_label.setText(f"批量下载失败: {str(e)}")
+            self.progress_bar.hide()
+
+    def update_batch_download_progress(self, current, total, file_name):
+        """更新批量下载进度"""
+        pass
+
+    def batch_download_finished(self):
+        """批量下载完成"""
+        pass
+
+    def pay_once_download(self, file_info):
+        """单次付费下载"""
+        QMessageBox.information(self, "付费下载", "付费下载功能已移除业务逻辑，仅保留界面。")
+
+    def start_actual_download(self, file_info):
+        """实际开始下载文件（付费下载后调用）"""
+        QMessageBox.information(self, "下载", "下载功能已移除业务逻辑，仅保留界面。")
+
+    def check_vip_status(self):
+        """检查用户VIP状态（本地）"""
+        pass
+        
+    def set_vip_status(self, is_vip: bool):
+        """设置用户VIP状态（本地）"""
+        self.is_vip = is_vip
+        # 更新文件树的选择模式
+        if is_vip:
+            self.file_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        else:
+            self.file_tree.setSelectionMode(QAbstractItemView.SingleSelection)
+
+    def start_download(self, file_info):
+        """开始下载文件"""
+        QMessageBox.information(self, "下载", "下载功能已移除业务逻辑，仅保留界面。")
+
+    def on_download_finished(self, success, file_name):
+        """处理下载完成的逻辑"""
+        QMessageBox.information(self, "下载完成", "下载功能已移除业务逻辑，仅保留界面。")
+
+    def share_file(self, file_info):
+        """分享文件信息"""
+        QMessageBox.information(self, "分享", "分享功能已移除业务逻辑，仅保留界面。")
+
+    def show_report_dialog(self, file_info):
+        """显示举报对话框"""
+        QMessageBox.information(self, "举报", "举报功能已移除业务逻辑，仅保留界面。")
 
     def format_size(self, size_bytes):
         """格式化文件大小显示"""

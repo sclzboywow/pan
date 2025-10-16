@@ -471,11 +471,15 @@ class APIClient(QObject):
             return None
     
     def call_public_api(self, operation: str, args: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
-        """调用公共API（无需认证）"""
+        """调用公共API（默认也携带JWT，以满足后端统一鉴权）"""
         try:
+            headers = {}
+            if self.user_jwt:
+                headers['Authorization'] = f'Bearer {self.user_jwt}'
             response = self.session.post(
                 f"{self.base_url}/mcp/public/exec",
-                json={"op": operation, "args": args or {}}
+                json={"op": operation, "args": args or {}},
+                headers=headers or None
             )
             if response.status_code == 200:
                 return response.json()
@@ -970,6 +974,43 @@ class APIClient(QObject):
             print(f"user_download_link失败: {e}")
             return {"status": "error", "error": str(e)}
 
+    def user_download_ticket(self, fsid: Union[int, str] = None, path: str = None, ttl: int = 300):
+        """用户态：签发后端代理下载票据（支持 fsid 或 path）。"""
+        try:
+            if not self.user_jwt:
+                return {"status": "error", "error": "not_logged_in"}
+            args: Dict[str, Any] = {}
+            if fsid is not None:
+                args['fsid'] = int(fsid) if str(fsid).isdigit() else fsid
+            if path:
+                args['path'] = path
+            if 'fsid' not in args and 'path' not in args:
+                # 前端防御：避免误调用导致后端返回 missing_dlink_or_fsid
+                try:
+                    import traceback
+                    print("[DEBUG][TICKET][USER] missing fsid/path. call stack:\n" + ''.join(traceback.format_stack(limit=8)))
+                except Exception:
+                    pass
+                return {"status": "error", "error": "missing_fsid_or_path"}
+            if ttl is not None:
+                args['ttl'] = int(ttl)
+            payload = {"op": "download_ticket", "args": args}
+            headers = {"Authorization": f"Bearer {self.user_jwt}"}
+            try:
+                print(f"[DEBUG][TICKET][USER] payload={payload}")
+            except Exception:
+                pass
+            resp = self.session.post(f"{self.base_url}/mcp/user/exec", json=payload, headers=headers)
+            if resp is None or not resp.content:
+                return {"status": "error", "error": "empty_response"}
+            try:
+                print(f"[DEBUG][TICKET][USER] resp_status={resp.status_code} body={resp.text[:300]}...")
+            except Exception:
+                pass
+            return resp.json()
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
     def user_download_links(self, fsids: list):
         """批量获取直链列表（用户态）"""
         if not self.user_jwt:
@@ -994,14 +1035,14 @@ class APIClient(QObject):
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    def public_download_ticket(self, fsid: Union[int, str] = None, dlink: str = None, ttl: int = 300):
-        """公共态：签发下载票据，用于后端流式代理下载"""
+    def public_download_ticket(self, fsid: Union[int, str] = None, path: str = None, ttl: int = 300):
+        """公共态：签发下载票据（支持 fsid 或 path），用于后端流式代理下载。"""
         try:
             args: Dict[str, Any] = {}
             if fsid is not None:
                 args['fsid'] = int(fsid) if str(fsid).isdigit() else fsid
-            if dlink:
-                args['dlink'] = dlink
+            if path:
+                args['path'] = path
             if ttl is not None:
                 args['ttl'] = int(ttl)
             payload = {"op": "download_ticket", "args": args}
@@ -1009,7 +1050,16 @@ class APIClient(QObject):
             headers = {}
             if self.user_jwt:
                 headers["Authorization"] = f"Bearer {self.user_jwt}"
+            try:
+                print(f"[DEBUG][TICKET][PUBLIC] payload={payload}")
+            except Exception:
+                pass
             resp = self.session.post(f"{self.base_url}/mcp/public/exec", json=payload, headers=headers or None)
+            if resp is not None and resp.content:
+                try:
+                    print(f"[DEBUG][TICKET][PUBLIC] resp_status={resp.status_code} body={resp.text[:300]}...")
+                except Exception:
+                    pass
             data = resp.json() if (resp is not None and resp.content) else None
             if not isinstance(data, dict):
                 return {"status": "error", "error": "empty_response"}
