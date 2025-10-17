@@ -1060,20 +1060,26 @@ class FileManagerUI(QMainWindow):
             # 获取文件名
             filename = file_info.get('server_filename') or file_info.get('file_name') or '未知文件'
             
-            # 简单的分享对话框
-            from PySide6.QtWidgets import QInputDialog
-            extract_code, ok = QInputDialog.getText(
-                self, 
-                "创建分享链接", 
-                f"为文件 '{filename}' 创建分享链接\n\n提取码（可选，留空则无密码）：",
-                text=""
-            )
-            if not ok:
+            # 使用ShareDialog收集分享配置
+            dialog = ShareDialog(self)
+            dialog.setWindowTitle(f"分享文件: {filename}")
+            if dialog.exec() != QDialog.Accepted:
                 return
+            
+            # 获取用户配置
+            expire_days_str, password, remark = dialog.get_values()
+            
+            # 验证有效期
+            try:
+                expire_days = int(expire_days_str) if expire_days_str else 7
+                if expire_days not in [1, 7, 30]:
+                    expire_days = 7
+            except ValueError:
+                expire_days = 7
             
             # 调用API创建分享链接
             self.status_label.setText("正在创建分享链接...")
-            result = self.api_client.create_share_link(str(fsid), extract_code.strip() if extract_code.strip() else None)
+            result = self.api_client.create_share_link(str(fsid), password if password else None, expire_days)
             
             if isinstance(result, dict) and result.get('status') in ('ok', 'success'):
                 share_url = result.get('share_url') or result.get('url') or result.get('link')
@@ -1085,15 +1091,18 @@ class FileManagerUI(QMainWindow):
                     
                     # 显示成功信息
                     msg = f"分享链接已创建并复制到剪贴板：\n\n{share_url}"
-                    if extract_code.strip():
-                        msg += f"\n\n提取码：{extract_code.strip()}"
+                    if password:
+                        msg += f"\n\n提取码：{password}"
+                    msg += f"\n\n有效期：{expire_days}天"
                     QMessageBox.information(self, "分享成功", msg)
                     self.status_label.setText("分享链接已创建")
                 else:
                     QMessageBox.warning(self, "分享", "创建成功但未获取到分享链接")
             else:
-                error_msg = result.get('error') if isinstance(result, dict) else "创建分享链接失败"
-                QMessageBox.warning(self, "分享", f"分享失败：{error_msg}")
+                error_msg = "创建分享链接失败"
+                if isinstance(result, dict):
+                    error_msg = result.get('message') or result.get('error') or error_msg
+                QMessageBox.warning(self, "分享", error_msg)
                 self.status_label.setText("分享失败")
                 
         except Exception as e:
@@ -2761,9 +2770,11 @@ class FileManagerUI(QMainWindow):
                     name, ok2 = QInputDialog.getText(self, "保存为", "文件名：")
                     if ok2 and name.strip():
                         import posixpath
-                        remote_path = posixpath.join(self.current_folder or '/', name.strip())
+                        # 拆分目录与文件名，符合后端API格式
+                        dir_path = self.current_folder or '/'
+                        filename = name.strip()
                         self.status_label.setText("正在通过URL上传...")
-                        resp = self.api_client.user_upload_url(url.strip(), remote_path)
+                        resp = self.api_client.user_upload_url(url.strip(), dir_path, filename)
                         self._show_result_msg(resp, "URL上传")
                         self.refresh_user_files()
                 return
@@ -2776,16 +2787,40 @@ class FileManagerUI(QMainWindow):
     def _show_result_msg(self, resp, action_name: str):
         """统一提示后端结果。"""
         try:
-            ok = isinstance(resp, dict) and (resp.get('status') == 'ok' or resp.get('success') is True or resp.get('errno') in (0, '0'))
-            if ok:
-                self.status_label.setText(f"{action_name}成功")
+            # 处理None响应
+            if resp is None:
+                QMessageBox.warning(self, action_name, f"{action_name}失败：未触达后端")
+                return
+            
+            # 处理字典响应
+            if isinstance(resp, dict):
+                # 检查成功状态 - 支持多种字段格式
+                ok = (resp.get('status') == 'ok' or 
+                      resp.get('success') is True or 
+                      resp.get('errno') in (0, '0') or
+                      resp.get('code') == 0 or
+                      resp.get('code') == '0')
+                
+                if ok:
+                    self.status_label.setText(f"{action_name}成功")
+                else:
+                    # 提取错误信息 - 支持多种字段格式
+                    err = (resp.get('error') or 
+                           resp.get('message') or
+                           resp.get('errmsg') or
+                           (resp.get('data') or {}).get('errmsg') or
+                           (resp.get('data') or {}).get('error'))
+                    
+                    if err:
+                        QMessageBox.warning(self, action_name, f"{action_name}失败：{err}")
+                    else:
+                        QMessageBox.warning(self, action_name, f"{action_name}失败：未知错误")
             else:
-                err = None
-                if isinstance(resp, dict):
-                    err = resp.get('error') or (resp.get('data') or {}).get('errmsg')
-                QMessageBox.warning(self, action_name, err or f"{action_name}失败")
-        except Exception:
-            pass
+                # 非字典响应
+                QMessageBox.warning(self, action_name, f"{action_name}失败：响应格式异常")
+                
+        except Exception as e:
+            QMessageBox.warning(self, action_name, f"{action_name}失败：{e}")
 
     def refresh_user_files(self):
         """刷新用户态当前目录文件列表。"""
@@ -2800,7 +2835,8 @@ class FileManagerUI(QMainWindow):
                 files = result.get('list') or result.get('files') or data.get('list') or data.get('files') or []
             elif isinstance(result, list):
                 files = result
-            self.display_files(files, append=False)
+            # 使用display_user_files保持用户态数据结构完整性
+            self.display_user_files(files, append=False)
             self.status_label.setText("已刷新")
         except Exception as e:
             QMessageBox.warning(self, "刷新", f"失败：{e}")
