@@ -56,6 +56,7 @@ class AuthThread(QThread):
     def stop(self):
         """停止轮询"""
         self.running = False
+        self.requestInterruption()  # 请求中断，配合_safe_sleep使用
 
 
 class AutoAuthThread(QThread):
@@ -78,7 +79,7 @@ class AutoAuthThread(QThread):
         attempts = 0
         poll_interval = 5  # 遵循设备授权最小间隔建议
         
-        while self.running and attempts < max_attempts:
+        while self.running and attempts < max_attempts and not self.isInterruptionRequested():
             try:
                 result = self.api_client.poll_auto_auth_status(
                     self.device_code, 
@@ -87,7 +88,7 @@ class AutoAuthThread(QThread):
             except Exception as e:
                 print(f"轮询网络错误: {e}")
                 # 网络错误时继续轮询，不中断
-                self.msleep(poll_interval * 1000)
+                self._safe_sleep(poll_interval * 1000)
                 attempts += 1
                 continue
             
@@ -146,12 +147,23 @@ class AutoAuthThread(QThread):
                     if attempts % 3 == 0:
                         self.status_update.emit("安全提示：二维码仅用于百度网盘授权，服务器不会保存任何个人信息。请在手机端扫码授权。")
             
-            self.msleep(poll_interval * 1000)
+            self._safe_sleep(poll_interval * 1000)
             attempts += 1
         
         if attempts >= max_attempts:
             self.auth_failed.emit("授权超时")
     
+    def _safe_sleep(self, milliseconds):
+        """安全的睡眠，支持中断请求"""
+        total_ms = milliseconds
+        step_ms = 100  # 每100ms检查一次中断请求
+        
+        while total_ms > 0 and not self.isInterruptionRequested() and self.running:
+            sleep_ms = min(step_ms, total_ms)
+            self.msleep(sleep_ms)
+            total_ms -= sleep_ms
+    
     def stop(self):
         """停止轮询"""
         self.running = False
+        self.requestInterruption()  # 请求中断，配合_safe_sleep使用

@@ -262,10 +262,36 @@ class LoginDialog(QDialog):
     
     def start_auth(self):
         """开始扫码授权"""
+        # 禁用按钮防止重复点击
+        self.start_auth_btn.setEnabled(False)
+        self.start_auth_btn.setText("生成中...")
+        
+        # 停止旧线程（如果存在）
+        if self.auth_thread and self.auth_thread.isRunning():
+            print("[DEBUG] 停止旧授权线程")
+            try:
+                # 断开信号连接
+                self.auth_thread.auth_success.disconnect(self.on_auth_success)
+                self.auth_thread.auth_failed.disconnect(self.on_auth_failed)
+                self.auth_thread.status_update.disconnect(self.auth_status_label.setText)
+            except Exception:
+                pass
+            
+            # 停止线程
+            self.auth_thread.stop()
+            # 等待线程结束，设置超时
+            if not self.auth_thread.wait(1000):
+                print("[DEBUG] 强制终止旧授权线程")
+                self.auth_thread.terminate()
+                self.auth_thread.wait(500)
+            self.auth_thread = None
+        
         # 使用自动授权，无需登录
         auth_data = self.api_client.start_auto_qr_auth()
         if not auth_data:
             QMessageBox.critical(self, "错误", "启动授权失败")
+            self.start_auth_btn.setEnabled(True)
+            self.start_auth_btn.setText("重新生成二维码")
             return
         
         # 兼容后端两种返回结构：顶层字段或 data 内字段
@@ -287,6 +313,10 @@ class LoginDialog(QDialog):
             self.auth_thread.auth_failed.connect(self.on_auth_failed)
             self.auth_thread.status_update.connect(self.auth_status_label.setText)
             self.auth_thread.start()
+            
+            # 重新启用按钮
+            self.start_auth_btn.setEnabled(True)
+            self.start_auth_btn.setText("重新生成二维码")
     
     def on_login_success(self, data):
         """登录成功处理"""
@@ -326,10 +356,10 @@ class LoginDialog(QDialog):
         # 安全停止轮询线程并断开信号
         if self.auth_thread:
             try:
-                # 断开所有信号连接
-                self.auth_thread.auth_success.disconnect()
-                self.auth_thread.auth_failed.disconnect()
-                self.auth_thread.status_update.disconnect()
+                # 显式断开信号连接，避免TypeError
+                self.auth_thread.auth_success.disconnect(self.on_auth_success)
+                self.auth_thread.auth_failed.disconnect(self.on_auth_failed)
+                self.auth_thread.status_update.disconnect(self.auth_status_label.setText)
             except Exception:
                 pass
             
@@ -389,10 +419,10 @@ class LoginDialog(QDialog):
         # 安全停止轮询线程
         if self.auth_thread and self.auth_thread.isRunning():
             try:
-                # 断开所有信号连接，避免关闭时的信号冲突
-                self.auth_thread.auth_success.disconnect()
-                self.auth_thread.auth_failed.disconnect()
-                self.auth_thread.status_update.disconnect()
+                # 显式断开信号连接，避免TypeError
+                self.auth_thread.auth_success.disconnect(self.on_auth_success)
+                self.auth_thread.auth_failed.disconnect(self.on_auth_failed)
+                self.auth_thread.status_update.disconnect(self.auth_status_label.setText)
             except Exception:
                 pass
             
