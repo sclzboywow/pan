@@ -1110,60 +1110,89 @@ class FileManagerUI(QMainWindow):
             self.status_label.setText("分享失败")
 
     def delete_user_item(self, file_info: dict, row: int = None):
-        """用户态：删除文件/目录（基于fs_id）。删除后轮询后端，直至条目消失或超时。"""
+        """用户态：删除文件/目录（异步操作）"""
         try:
+            # 检查是否已有删除任务在运行
+            if hasattr(self, 'delete_worker') and self.delete_worker and self.delete_worker.isRunning():
+                QMessageBox.warning(self, "删除", "已有删除任务在运行，请等待完成后再试")
+                return
+            
             fsid = file_info.get('fs_id') or file_info.get('fsid')
             if not fsid:
                 raise RuntimeError('缺少fs_id')
-            ret = self.api_client.delete_file(str(fsid))
-            if isinstance(ret, dict) and (ret.get('status') in ('ok','success')):
-                # UI先行移除该行，随后轻量刷新
+            
+            # 获取文件路径
+            file_path = file_info.get('path', '')
+            if not file_path:
+                raise RuntimeError('缺少文件路径')
+            
+            # 创建异步删除工作线程
+            from ui.threads.delete_worker import DeleteWorker
+            self.delete_worker = DeleteWorker(
+                self.api_client, 
+                file_path, 
+                str(fsid), 
+                self.mode_token
+            )
+            
+            # 连接信号
+            self.delete_worker.delete_started.connect(self._on_delete_started)
+            self.delete_worker.delete_progress.connect(self._on_delete_progress)
+            self.delete_worker.delete_completed.connect(self._on_delete_completed)
+            
+            # 立即从UI中移除该行
+            if row is not None:
                 try:
-                    if row is not None:
-                        mdl = self.file_tree.model()
-                        if mdl:
-                            mdl.removeRow(row)
+                    mdl = self.file_tree.model()
+                    if mdl:
+                        mdl.removeRow(row)
                 except Exception:
                     pass
-                # 启动轮询确认（最多约10秒）
-                start_ts = time.time()
-                target_id = str(fsid)
-                disappeared = False
-                while time.time() - start_ts < 10:
-                    try:
-                        lst = self.api_client.list_files(self.current_folder, limit=200)
-                        items = []
-                        if isinstance(lst, dict):
-                            data = lst.get('data') or lst
-                            items = data.get('list') or data.get('files') or data.get('items') or []
-                        elif isinstance(lst, list):
-                            items = lst
-                        present = False
-                        for it in items:
-                            cur = str(it.get('fs_id') or it.get('fsid') or '')
-                            if cur and cur == target_id:
-                                present = True
-                                break
-                        if not present:
-                            disappeared = True
-                            break
-                        QApplication.processEvents()
-                        time.sleep(0.4)
-                    except Exception:
-                        break
-                # 最终刷新一次
-                from PySide6.QtCore import QTimer
-                QTimer.singleShot(100, self.load_files)
-                QMessageBox.information(self, "删除", "已删除" if disappeared else "已提交删除（后台处理可能稍有延迟）")
-            else:
-                err = ''
-                try:
-                    err = (ret or {}).get('error') or ((ret or {}).get('data') or {}).get('errmsg') or ''
-                except Exception:
-                    pass
-                raise RuntimeError(err or '删除失败')
+            
+            # 启动异步删除
+            self.delete_worker.start()
+            
         except Exception as e:
-            QMessageBox.warning(self, "删除", f"删除失败：{e}")
+            QMessageBox.critical(self, "删除异常", str(e))
+    
+    def _on_delete_started(self, file_path: str):
+        """删除开始回调"""
+        print(f"[DEBUG] 开始删除: {file_path}")
+        if hasattr(self, 'statusBar') and self.statusBar:
+            self.statusBar.showMessage(f"正在删除: {file_path}")
+    
+    def _on_delete_progress(self, file_path: str, message: str):
+        """删除进度回调"""
+        print(f"[DEBUG] 删除进度: {file_path} - {message}")
+        if hasattr(self, 'statusBar') and self.statusBar:
+            self.statusBar.showMessage(f"删除进度: {message}")
+    
+    def _on_delete_completed(self, file_path: str, success: bool, message: str):
+        """删除完成回调"""
+        print(f"[DEBUG] 删除完成: {file_path} - 成功: {success} - {message}")
+        
+        # 清理工作线程
+        if hasattr(self, 'delete_worker'):
+            # 等待线程结束
+            if self.delete_worker.isRunning():
+                self.delete_worker.quit()
+                self.delete_worker.wait(3000)  # 等待最多3秒
+            self.delete_worker.deleteLater()
+            delattr(self, 'delete_worker')
+        
+        # 刷新文件列表
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(100, self.load_files)
+        
+        # 显示结果消息
+        if success:
+            QMessageBox.information(self, "删除", message)
+        else:
+            QMessageBox.warning(self, "删除失败", message)
+        
+        # 清除状态栏消息
+        if hasattr(self, 'statusBar') and self.statusBar:
+            self.statusBar.clearMessage()
     
     def load_demo_files(self):
         """加载演示文件数据"""
@@ -2553,6 +2582,7 @@ class FileManagerUI(QMainWindow):
         """显示右键菜单。
         - 公共资源模式：阅读/下载/分享/举报
         - 用户态模式：打开/刷新/新建文件夹/重命名/移动/复制/删除/上传
+        - 用户态空白区域：刷新/新建文件夹/上传
         """
         try:
             # 公共资源模式
@@ -2601,34 +2631,224 @@ class FileManagerUI(QMainWindow):
                 return
             
             index = self.file_tree.indexAt(position)
-            if not index.isValid():
-                return
-            row = index.row()
-            
-            # 使用通用方法获取行数据
-            row_data = self.get_user_row_payload(row)
-            if not row_data:
-                QMessageBox.warning(self, "右键菜单", "无法获取文件信息")
-                return
-            
-            file_info = row_data['payload']
-            fs_id = row_data['fsid']
-
             menu = QMenu(self)
-            act_open = menu.addAction("打开")
-            act_refresh = menu.addAction("刷新")
-            menu.addSeparator()
-            act_share = menu.addAction("分享")
-            menu.addSeparator()
-            act_new_folder = menu.addAction("新建文件夹")
-            act_rename = menu.addAction("重命名")
-            act_move = menu.addAction("移动到...")
-            act_copy = menu.addAction("复制到...")
-            act_delete = menu.addAction("删除")
-            menu.addSeparator()
-            act_upload_local = menu.addAction("上传本地文件...")
-            act_upload_text = menu.addAction("上传文本...")
-            act_upload_url = menu.addAction("通过URL上传...")
+            
+            # 检查是否点击在有效项目上
+            if index.isValid():
+                # 点击在文件/文件夹上 - 显示完整菜单
+                row = index.row()
+                
+                # 使用通用方法获取行数据
+                row_data = self.get_user_row_payload(row)
+                if not row_data:
+                    QMessageBox.warning(self, "右键菜单", "无法获取文件信息")
+                    return
+                
+                file_info = row_data['payload']
+                fs_id = row_data['fsid']
+
+                # 文件/文件夹上的完整菜单
+                act_open = menu.addAction("打开")
+                act_refresh = menu.addAction("刷新")
+                menu.addSeparator()
+                act_share = menu.addAction("分享")
+                menu.addSeparator()
+                act_new_folder = menu.addAction("新建文件夹")
+                act_rename = menu.addAction("重命名")
+                act_move = menu.addAction("移动到...")
+                act_copy = menu.addAction("复制到...")
+                act_delete = menu.addAction("删除")
+                menu.addSeparator()
+                act_upload_local = menu.addAction("上传本地文件...")
+                act_upload_text = menu.addAction("上传文本...")
+                act_upload_url = menu.addAction("通过URL上传...")
+
+                global_pos = self.file_tree.viewport().mapToGlobal(position)
+                action = menu.exec(global_pos)
+                if action is None:
+                    return
+
+                if action == act_open:
+                    # 复用现有的打开/预览逻辑
+                    file_raw = row_data['file']
+                    is_dir = int(file_raw.get('isdir') or 0) == 1
+                    if is_dir:
+                        # 文件夹：进入目录
+                        path_val = row_data['path'] or '/'
+                        self.current_folder = path_val
+                        self.load_files()
+                    else:
+                        # 文件：预览
+                        self.open_file_preview(file_raw)
+                    return
+                if action == act_refresh:
+                    self.refresh_user_files()
+                    return
+                if action == act_share:
+                    # 分享功能
+                    file_raw = row_data['file']
+                    self.share_user_file(file_raw)
+                    return
+                if action == act_new_folder:
+                    text, ok = QInputDialog.getText(self, "新建文件夹", "名称：")
+                    if ok and text.strip():
+                        resp = self.api_client.create_folder(self.current_folder or '/', text.strip())
+                        self._show_result_msg(resp, "新建文件夹")
+                        self.refresh_user_files()
+                    return
+                if action == act_rename:
+                    if not fs_id:
+                        QMessageBox.warning(self, "重命名", "请选择一个文件/夹")
+                        return
+                    new_name, ok = QInputDialog.getText(self, "重命名", "新名称：")
+                    if ok and new_name.strip():
+                        resp = self.api_client.rename_file(str(fs_id), new_name.strip())
+                        self._show_result_msg(resp, "重命名")
+                        self.refresh_user_files()
+                    return
+                if action == act_move:
+                    if not fs_id:
+                        QMessageBox.warning(self, "移动", "请选择一个文件/夹")
+                        return
+                    
+                    # 使用目录选择对话框
+                    from ui.dialogs.folder_selector_dialog import FolderSelectorDialog
+                    dialog = FolderSelectorDialog(
+                        self, 
+                        self.api_client, 
+                        self.current_folder or '/',
+                        "移动到"
+                    )
+                    if dialog.exec() == QDialog.Accepted:
+                        target_path = dialog.current_folder
+                        if target_path != self.current_folder:
+                            resp = self.api_client.move_file(str(fs_id), target_path)
+                            self._show_result_msg(resp, "移动")
+                            self.refresh_user_files()
+                    return
+                if action == act_copy:
+                    if not fs_id:
+                        QMessageBox.warning(self, "复制", "请选择一个文件/夹")
+                        return
+                    
+                    # 使用目录选择对话框
+                    from ui.dialogs.folder_selector_dialog import FolderSelectorDialog
+                    dialog = FolderSelectorDialog(
+                        self, 
+                        self.api_client, 
+                        self.current_folder or '/',
+                        "复制到"
+                    )
+                    if dialog.exec() == QDialog.Accepted:
+                        target_path = dialog.current_folder
+                        if target_path != self.current_folder:
+                            resp = self.api_client.copy_file(str(fs_id), target_path)
+                            self._show_result_msg(resp, "复制")
+                            self.refresh_user_files()
+                    return
+                if action == act_delete:
+                    file_raw = row_data['file']
+                    self.delete_user_item(file_raw, row)
+                    return
+                if action == act_upload_local:
+                    file_path, _ = QFileDialog.getOpenFileName(self, "选择要上传的文件")
+                    if file_path:
+                        import posixpath
+                        filename = os.path.basename(file_path)
+                        remote_path = posixpath.join(self.current_folder or '/', filename)
+                        self.status_label.setText("正在上传文件...")
+                        resp = self.api_client.upload_local_file(file_path, remote_path)
+                        self._show_result_msg(resp, "上传文件")
+                        self.refresh_user_files()
+                    return
+                if action == act_upload_text:
+                    text, ok = QInputDialog.getMultiLineText(self, "上传文本", "文本内容：")
+                    if ok and text.strip():
+                        name, ok2 = QInputDialog.getText(self, "保存为", "文件名：")
+                        if ok2 and name.strip():
+                            import posixpath
+                            remote_path = posixpath.join(self.current_folder or '/', name.strip())
+                            self.status_label.setText("正在上传文本...")
+                            resp = self.api_client.upload_text_file(text, remote_path)
+                            self._show_result_msg(resp, "上传文本")
+                            self.refresh_user_files()
+                    return
+                if action == act_upload_url:
+                    url, ok = QInputDialog.getText(self, "通过URL上传", "资源URL：")
+                    if ok and url:
+                        name, ok2 = QInputDialog.getText(self, "保存为", "文件名：")
+                        if ok2 and name.strip():
+                            import posixpath
+                            # 拆分目录与文件名，符合后端API格式
+                            dir_path = self.current_folder or '/'
+                            filename = name.strip()
+                            self.status_label.setText("正在通过URL上传...")
+                            resp = self.api_client.user_upload_url(url.strip(), dir_path, filename)
+                            self._show_result_msg(resp, "URL上传")
+                            self.refresh_user_files()
+                    return
+            else:
+                # 点击在空白区域 - 显示简化菜单
+                act_refresh = menu.addAction("刷新")
+                menu.addSeparator()
+                act_new_folder = menu.addAction("新建文件夹")
+                menu.addSeparator()
+                act_upload_local = menu.addAction("上传本地文件...")
+                act_upload_text = menu.addAction("上传文本...")
+                act_upload_url = menu.addAction("通过URL上传...")
+
+                global_pos = self.file_tree.viewport().mapToGlobal(position)
+                action = menu.exec(global_pos)
+                if action is None:
+                    return
+
+                if action == act_refresh:
+                    self.refresh_user_files()
+                    return
+                if action == act_new_folder:
+                    text, ok = QInputDialog.getText(self, "新建文件夹", "名称：")
+                    if ok and text.strip():
+                        resp = self.api_client.create_folder(self.current_folder or '/', text.strip())
+                        self._show_result_msg(resp, "新建文件夹")
+                        self.refresh_user_files()
+                    return
+                if action == act_upload_local:
+                    file_path, _ = QFileDialog.getOpenFileName(self, "选择要上传的文件")
+                    if file_path:
+                        import posixpath
+                        filename = os.path.basename(file_path)
+                        remote_path = posixpath.join(self.current_folder or '/', filename)
+                        self.status_label.setText("正在上传文件...")
+                        resp = self.api_client.upload_local_file(file_path, remote_path)
+                        self._show_result_msg(resp, "上传文件")
+                        self.refresh_user_files()
+                    return
+                if action == act_upload_text:
+                    text, ok = QInputDialog.getMultiLineText(self, "上传文本", "文本内容：")
+                    if ok and text.strip():
+                        name, ok2 = QInputDialog.getText(self, "保存为", "文件名：")
+                        if ok2 and name.strip():
+                            import posixpath
+                            remote_path = posixpath.join(self.current_folder or '/', name.strip())
+                            self.status_label.setText("正在上传文本...")
+                            resp = self.api_client.upload_text_file(text, remote_path)
+                            self._show_result_msg(resp, "上传文本")
+                            self.refresh_user_files()
+                    return
+                if action == act_upload_url:
+                    url, ok = QInputDialog.getText(self, "通过URL上传", "资源URL：")
+                    if ok and url:
+                        name, ok2 = QInputDialog.getText(self, "保存为", "文件名：")
+                        if ok2 and name.strip():
+                            import posixpath
+                            # 拆分目录与文件名，符合后端API格式
+                            dir_path = self.current_folder or '/'
+                            filename = name.strip()
+                            self.status_label.setText("正在通过URL上传...")
+                            resp = self.api_client.user_upload_url(url.strip(), dir_path, filename)
+                            self._show_result_msg(resp, "URL上传")
+                            self.refresh_user_files()
+                    return
 
             global_pos = self.file_tree.viewport().mapToGlobal(position)
             action = menu.exec(global_pos)
@@ -2800,6 +3020,26 @@ class FileManagerUI(QMainWindow):
                       resp.get('errno') in (0, '0') or
                       resp.get('code') == 0 or
                       resp.get('code') == '0')
+                
+                # 特殊处理：即使status是ok，也要检查data中的errno
+                if resp.get('status') == 'ok' and 'data' in resp:
+                    data = resp.get('data', {})
+                    if isinstance(data, dict) and 'errno' in data:
+                        data_errno = data.get('errno')
+                        if data_errno not in (0, '0'):
+                            ok = False
+                            # 提供更详细的错误信息
+                            if data_errno == -8:
+                                error_msg = "文件夹可能已存在或名称不合法"
+                            elif data_errno == -6:
+                                error_msg = "权限不足"
+                            elif data_errno == -7:
+                                error_msg = "磁盘空间不足"
+                            else:
+                                error_msg = f"错误码: {data_errno}"
+                            
+                            QMessageBox.warning(self, action_name, f"{action_name}失败：{error_msg}")
+                            return
                 
                 if ok:
                     self.status_label.setText(f"{action_name}成功")

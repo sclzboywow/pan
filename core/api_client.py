@@ -446,9 +446,12 @@ class APIClient(QObject):
             return None
         
         try:
+            # 确保请求头包含Authorization
+            headers = {"Authorization": f"Bearer {self.user_jwt}"}
             response = self.session.post(
                 f"{self.base_url}/mcp/user/exec",
-                json={"op": operation, "args": args or {}}
+                json={"op": operation, "args": args or {}},
+                headers=headers
             )
             if response.status_code == 200:
                 return response.json()
@@ -457,9 +460,11 @@ class APIClient(QObject):
                 print(f"[DEBUG] API调用失败 (HTTP {response.status_code})，尝试刷新token...")
                 if self.refresh_token():
                     # 刷新成功，重试请求
+                    headers = {"Authorization": f"Bearer {self.user_jwt}"}
                     response = self.session.post(
                         f"{self.base_url}/mcp/user/exec",
-                        json={"op": operation, "args": args or {}}
+                        json={"op": operation, "args": args or {}},
+                        headers=headers
                     )
                     if response.status_code == 200:
                         return response.json()
@@ -569,42 +574,101 @@ class APIClient(QObject):
     
     def create_folder(self, dir_path: str, folder_name: str) -> Optional[Dict[str, Any]]:
         """创建文件夹"""
-        return self.call_api("mkdir", {"dir": dir_path, "folder_name": folder_name})
+        # 使用path和rtype参数格式（与后端API规范一致）
+        # 构建完整路径：dir_path + "/" + folder_name
+        import posixpath
+        full_path = posixpath.join(dir_path, folder_name)
+        return self.call_api("mkdir", {"path": full_path, "rtype": 0})
     
-    def delete_file(self, fs_id: str) -> Optional[Dict[str, Any]]:
+    def delete_file(self, file_path: str) -> Optional[Dict[str, Any]]:
         """删除文件"""
-        return self.call_api("delete", {"fs_id": fs_id})
+        # 使用路径格式的filelist参数
+        filelist = [file_path]
+        return self.call_api("delete", {"filelist": json.dumps(filelist), "async": 1, "ondup": "overwrite"})
     
-    def move_file(self, fs_id: str, target_dir: str) -> Optional[Dict[str, Any]]:
+    def move_file(self, source_path: str, target_dir: str, new_name: str = None) -> Optional[Dict[str, Any]]:
         """移动文件"""
-        return self.call_api("move", {"fs_id": fs_id, "target_dir": target_dir})
+        # 使用路径格式的filelist参数
+        move_item = {"path": source_path, "dest": target_dir}
+        if new_name:
+            move_item["newname"] = new_name
+        filelist = [move_item]
+        return self.call_api("move", {"filelist": json.dumps(filelist), "async": 1, "ondup": "overwrite"})
     
-    def rename_file(self, fs_id: str, new_name: str) -> Optional[Dict[str, Any]]:
+    def rename_file(self, file_path: str, new_name: str) -> Optional[Dict[str, Any]]:
         """重命名文件"""
-        return self.call_api("rename", {"fs_id": fs_id, "new_name": new_name})
+        # 使用移动操作实现重命名（移动到同一目录但使用新名称）
+        import posixpath
+        dir_path = posixpath.dirname(file_path)
+        return self.move_file(file_path, dir_path, new_name)
     
-    def copy_file(self, fs_id: str, target_dir: str) -> Optional[Dict[str, Any]]:
+    def copy_file(self, source_path: str, target_dir: str) -> Optional[Dict[str, Any]]:
         """复制文件"""
-        return self.call_api("copy", {"fs_id": fs_id, "target_dir": target_dir})
+        # 使用路径格式的filelist参数
+        filelist = [{"path": source_path, "dest": target_dir}]
+        return self.call_api("copy", {"filelist": json.dumps(filelist), "async": 1, "ondup": "overwrite"})
     
     def upload_local_file(self, local_path: str, remote_path: str, 
                          concurrent: int = 3) -> Optional[Dict[str, Any]]:
         """上传本地文件"""
+        # 使用规范的参数格式
         return self.call_api("upload_local", {
-            "local_path": local_path,
+            "local_file_path": local_path,
             "remote_path": remote_path,
-            "concurrent": concurrent
+            "max_concurrent": concurrent
         })
 
     # ---------- 公共/用户：上传（URL/文本/本地/批量） ----------
     def user_upload_url(self, url: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
+        """用户态URL上传"""
         return self.call_api("upload_url", {"url": url, "dir": dir_path, "filename": filename})
 
     def public_upload_url(self, url: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
         return self.call_public_api("upload_url", {"url": url, "dir": dir_path, "filename": filename})
 
     def user_upload_text(self, content: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
+        """用户态文本上传"""
         return self.call_api("upload_text", {"content": content, "dir": dir_path, "filename": filename})
+
+    def user_upload_local_file(self, local_path: str, remote_path: str, max_concurrent: int = 3) -> Optional[Dict[str, Any]]:
+        """用户态本地文件上传 - 使用POST /upload端点"""
+        # 验证路径限制：必须限制在/用户上传目录下
+        if not remote_path.startswith('/用户上传'):
+            return {"status": "error", "error": "upload_dir_not_allowed", "message": "用户态上传路径必须限制在/用户上传目录下"}
+        
+        try:
+            if not self.user_jwt:
+                return {"status": "error", "error": "not_logged_in"}
+            
+            # 从remote_path中提取目录和文件名
+            import posixpath
+            dir_path = posixpath.dirname(remote_path)
+            filename = posixpath.basename(remote_path)
+            
+            if not filename:
+                return {"status": "error", "error": "invalid_filename"}
+            
+            url = f"{self.base_url}/upload"
+            with open(local_path, 'rb') as f:
+                files = {
+                    'file': (filename, f, 'application/octet-stream')
+                }
+                data = {
+                    'dir': dir_path,
+                    'filename': filename
+                }
+                headers = {
+                    'Authorization': f'Bearer {self.user_jwt}'
+                }
+                # 使用requests.post避免session headers Content-Type冲突
+                import requests
+                resp = requests.post(url, data=data, files=files, headers=headers)
+                if resp.status_code == 200:
+                    return resp.json()
+                else:
+                    return {"status": "error", "error": f"HTTP {resp.status_code}", "response": resp.text}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
     def public_upload_text(self, content: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
         return self.call_public_api("upload_text", {"content": content, "dir": dir_path, "filename": filename})
@@ -616,23 +680,26 @@ class APIClient(QObject):
             "concurrent": concurrent
         })
 
-    def user_upload_batch_url(self, url_list: list) -> Optional[Dict[str, Any]]:
+    def user_upload_batch_url(self, url_list: list, max_concurrent: int = 3) -> Optional[Dict[str, Any]]:
+        """用户态批量URL上传"""
         # url_list: [{"url":"...","dir_path":"/用户上传/...","filename":"..."}, ...]
-        return self.call_api("upload_batch_url", {"url_list": url_list})
+        return self.call_api("upload_batch_url", {"url_list": url_list, "max_concurrent": max_concurrent})
 
     def public_upload_batch_url(self, url_list: list) -> Optional[Dict[str, Any]]:
         return self.call_public_api("upload_batch_url", {"url_list": url_list})
 
-    def user_upload_batch_text(self, text_list: list) -> Optional[Dict[str, Any]]:
-        # text_list: [{"content":"...","dir":"/用户上传/...","filename":"..."}, ...]
-        return self.call_api("upload_batch_text", {"text_list": text_list})
+    def user_upload_batch_text(self, text_list: list, max_concurrent: int = 3) -> Optional[Dict[str, Any]]:
+        """用户态批量文本上传"""
+        # text_list: [{"content":"...","dir_path":"/用户上传/...","filename":"..."}, ...]
+        return self.call_api("upload_batch_text", {"text_list": text_list, "max_concurrent": max_concurrent})
 
     def public_upload_batch_text(self, text_list: list) -> Optional[Dict[str, Any]]:
         return self.call_public_api("upload_batch_text", {"text_list": text_list})
 
-    def user_upload_batch_local(self, file_list: list) -> Optional[Dict[str, Any]]:
+    def user_upload_batch_local(self, file_list: list, max_concurrent: int = 3) -> Optional[Dict[str, Any]]:
+        """用户态批量本地文件上传"""
         # file_list: [{"local_path":"...","remote_path":"/用户上传/..."}, ...]
-        return self.call_api("upload_batch_local", {"file_list": file_list})
+        return self.call_api("upload_batch_local", {"file_list": file_list, "max_concurrent": max_concurrent})
 
     def public_upload_batch_local(self, file_list: list) -> Optional[Dict[str, Any]]:
         return self.call_public_api("upload_batch_local", {"file_list": file_list})
@@ -719,6 +786,39 @@ class APIClient(QObject):
     def cancel_offline_download(self, task_id: str) -> Optional[Dict[str, Any]]:
         """取消离线下载任务"""
         return self.call_api("offline_cancel", {"task_id": task_id})
+    
+    def get_quota(self) -> Optional[Dict[str, Any]]:
+        """获取配额信息"""
+        return self.call_api("quota", {})
+    
+    def get_file_metas(self, fsids: List[str], thumb: bool = False, extra: bool = False) -> Optional[Dict[str, Any]]:
+        """获取文件元信息"""
+        return self.call_api("file_metas", {
+            "fsids": fsids,
+            "thumb": thumb,
+            "extra": extra
+        })
+    
+    def _handle_api_error(self, response_data: Dict[str, Any]) -> str:
+        """统一的API错误处理"""
+        if not isinstance(response_data, dict):
+            return "未知错误"
+        
+        data = response_data.get('data', {})
+        errno = data.get('errno', 0)
+        
+        error_messages = {
+            0: "操作成功",
+            -6: "身份验证失败，请重新登录",
+            -7: "文件或目录名错误或无权访问",
+            -8: "文件或目录已存在",
+            -9: "文件或目录不存在",
+            2: "文件不存在或参数错误",
+            12: "批量操作中有文件不存在",
+            31045: "access_token验证未通过，请重新授权"
+        }
+        
+        return error_messages.get(errno, f"未知错误码: {errno}")
     
     def is_logged_in(self) -> bool:
         """检查是否已登录"""
