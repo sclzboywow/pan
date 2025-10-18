@@ -299,6 +299,14 @@ class FileManagerUI(QMainWindow):
         # 用户态表格初始化标志，避免重复连接信号
         self.user_ui_inited = False
         
+        # 用户态搜索状态变量
+        self.user_search_mode = False
+        self.user_search_keyword = ""
+        self.user_search_dir = "/"
+        self.user_search_page = 1
+        self.user_search_page_size = 50
+        self.user_search_has_more = True
+        
         # 模式管理
         self.current_mode = "public"  # "public" 或 "user"
         self.mode_token = 0  # 模式版本号，用于异步任务验证
@@ -398,22 +406,34 @@ class FileManagerUI(QMainWindow):
             old_mode = self.current_mode
             self.current_mode = mode
             self.in_public = (mode == "public")
+            print(f"[DEBUG] 模式切换完成: {old_mode} -> {mode}, token={self.api_client.user_jwt is not None}")
             if old_mode != mode:  # 只有在真正切换时才递增版本号
                 self.mode_token += 1
             
             # 断开所有已知的信号连接
             try:
-                self.file_tree.clicked.disconnect(self.on_public_cell_clicked)
-            except Exception:
-                pass
-            try:
-                self.file_tree.clicked.disconnect(self.on_user_cell_clicked)
+                self.file_tree.clicked.disconnect()
             except Exception:
                 pass
             
             # 重置UI初始化标志
             self.public_ui_inited = False
             self.user_ui_inited = False
+            
+            # 清理对方模式的搜索状态
+            if mode == "public":
+                # 切换到公共态时，清理用户态搜索状态
+                self.user_search_mode = False
+                self.user_search_keyword = ""
+                self.user_search_dir = "/"
+                self.user_search_page = 1
+                self.user_search_has_more = False
+            else:  # user
+                # 切换到用户态时，清理公共态搜索状态
+                self.public_search_mode = False
+                self.public_search_keyword = ""
+                self.public_page = 1
+                self.public_has_more = False
             
             # 清除旧模型
             self.file_tree.setModel(None)
@@ -630,6 +650,9 @@ class FileManagerUI(QMainWindow):
     
     def load_files(self):
         """加载文件列表（用户态：使用与公共态相同的表格布局）"""
+        # 重置用户态搜索状态
+        self.user_search_mode = False
+        
         # 检查登录状态，添加调试信息
         is_logged_in = self.api_client.is_logged_in()
         user_jwt_info = f"exists (len={len(self.api_client.user_jwt)})" if self.api_client.user_jwt else 'None'
@@ -842,8 +865,6 @@ class FileManagerUI(QMainWindow):
     def on_user_cell_clicked(self, index):
         """处理用户态表格的单元格点击（打开/下载/分享/删除）"""
         try:
-            # 进入用户态事件处理上下文，防止标志位不同步
-            self.in_public = False
             # 态校验：必须在用户态
             mode_result = self._ensure_mode(False, "网盘操作")
             if mode_result != "ok":
@@ -2015,7 +2036,7 @@ class FileManagerUI(QMainWindow):
             files = []
             result = None
             if self.public_search_mode and self.public_search_keyword:
-                # 使用 /files/list + file_path 以支持分页
+                # 使用 /files/list + file_path 以支持分页（保持远端仓库逻辑）
                 result = self.api_client.files_list(
                     page=page,
                     page_size=self.public_page_size,
@@ -2056,7 +2077,7 @@ class FileManagerUI(QMainWindow):
 
     def display_public_files(self, files, append: bool = False):
         """在主列表控件内显示公共资源列表，支持追加"""
-        from PySide6.QtGui import QStandardItem
+        from PySide6.QtGui import QStandardItem, QStandardItemModel
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QHeaderView
         from PySide6.QtGui import QColor, QBrush
@@ -2180,8 +2201,6 @@ class FileManagerUI(QMainWindow):
     def on_public_cell_clicked(self, index):
         """处理公共资源表格的单元格点击（分享/下载/阅读/举报）"""
         try:
-            # 进入公共态事件处理上下文，防止标志位不同步
-            self.in_public = True
             # 态校验：必须在公共态
             mode_result = self._ensure_mode(True, "公共资源操作")
             if mode_result != "ok":
@@ -2550,10 +2569,15 @@ class FileManagerUI(QMainWindow):
     def search_files(self):
         """搜索文件"""
         search_text = self.search_input.text().strip()
+        print(f"[DEBUG] search_files mode={self.current_mode} in_public={self.in_public}")
         if not search_text:
+            # 清空搜索框时重置搜索状态
+            if self.user_search_mode:
+                self.user_search_mode = False
+                self.load_files()  # 重新加载文件列表
             return
         
-        if self.in_public:
+        if self.current_mode == "public":
             # 公共资源搜索：清空并分页加载
             self.status_label.setText("公共资源：搜索中...")
             self.public_page = 1
@@ -2566,7 +2590,7 @@ class FileManagerUI(QMainWindow):
             self.search_input.setText("")
             return
         
-        # 原有私有网盘搜索
+        # 用户态搜索
         if not self.api_client.is_logged_in():
             reply = QMessageBox.question(
                 self, 
@@ -2579,16 +2603,45 @@ class FileManagerUI(QMainWindow):
                 self.show_my_info()
             return
         
+        # 初始化用户态搜索状态
+        self.user_search_mode = True
+        self.user_search_keyword = search_text
+        self.user_search_dir = self.current_folder or "/"
+        self.user_search_page = 1
+        self.user_search_has_more = True
+        
         self.is_loading = True
         self.status_label.setText("正在搜索...")
         
         # 调用搜索API
-        result = self.api_client.search_filename(search_text, self.current_folder)
-        if result and result.get("status") == "ok":
+        result = self.api_client.search_filename(
+            key=search_text, 
+            dir_path=self.user_search_dir, 
+            page=self.user_search_page, 
+            num=self.user_search_page_size, 
+            recursion=True
+        )
+        
+        # 调试信息：打印响应结构
+        if result:
+            print(f"[DEBUG] search_files response status: {result.get('status')}")
+            print(f"[DEBUG] search_files response data keys: {list(result.get('data', {}).keys()) if result.get('data') else 'None'}")
+        
+        # 兼容多种status格式
+        status = result.get("status", "").lower() if result else ""
+        if result and status in ["ok", "success"]:
             data = result.get("data", {})
-            files = data.get("list", [])
-            self.display_files(files)
-            self.status_label.setText(f"找到 {len(files)} 个匹配文件")
+            # 放宽结果解析，支持多种字段名
+            files = data.get("list") or data.get("files") or result.get("files") or []
+            print(f"[DEBUG] search_files found {len(files)} files")
+            self.display_user_files(files, append=False)
+            
+            # 计算是否有更多结果，兼容多种has_next格式
+            has_next = bool(data.get("has_next")) if "has_next" in data else len(files) >= self.user_search_page_size
+            if not has_next and len(files) < self.user_search_page_size:
+                self.user_search_has_more = False
+            
+            self.status_label.setText(f"找到 {len(files)} 个结果（第 {self.user_search_page} 页）")
         else:
             error_msg = result.get("error", "搜索失败") if result else "网络连接失败"
             self.status_label.setText(f"搜索失败: {error_msg}")
@@ -3227,6 +3280,9 @@ class FileManagerUI(QMainWindow):
 
     def refresh_user_files(self):
         """刷新用户态当前目录文件列表。"""
+        # 重置用户态搜索状态
+        self.user_search_mode = False
+        
         try:
             if not self.api_client.is_logged_in():
                 QMessageBox.information(self, "刷新", "请先登录")
@@ -3247,48 +3303,46 @@ class FileManagerUI(QMainWindow):
     def check_scroll_position(self, value):
         """检查滚动位置，到底时加载更多"""
         scrollbar = self.file_tree.verticalScrollBar()
+        
+        # 用户态搜索模式：到底自动加载下一页
+        if self.user_search_mode and self.current_mode == "user":
+            if value == scrollbar.maximum() and not self.is_loading and self.user_search_has_more:
+                self.load_more_user_search()
+            return
+        
         # 公共资源模式：到底自动加载下一页
-        if self.in_public:
+        if self.current_mode == "public":
             if value == scrollbar.maximum() and not self.public_loading and self.public_has_more:
                 self.load_public_resources(load_more=True)
             return
-        # 原有逻辑（网盘文件）
-        # 当滚动到底部且不在加载状态且还有更多数据时
-        if (value == scrollbar.maximum() and 
-            not self.is_loading and 
-            self.has_more):
-            self.load_more_files()
-        elif value == scrollbar.maximum() and not self.has_more:
-            # 当滚动到底部但没有更多数据时显示提示
-            self.status_label.setText("已加载全部文件")
+        
+        # 用户态目录列表滚动处理
+        if self.current_mode == "user":
+            if value == scrollbar.maximum() and not self.is_loading and self.has_more:
+                self.load_more_user_files()
+            elif value == scrollbar.maximum() and not self.has_more:
+                # 当滚动到底部但没有更多数据时显示提示
+                self.status_label.setText("已加载全部文件")
     
-    def load_more_files(self):
-        """加载更多文件"""
+    def load_more_user_files(self):
+        """加载更多用户态文件"""
+        if not self.api_client.is_logged_in():
+            return
+            
         self.is_loading = True
         self.status_label.setText("正在加载更多文件...")
         self.current_page += 1
         
         try:
-            # 构造请求参数
-            params = {
-                'method': 'list',
-                'access_token': self.access_token,
-                'dir': self.current_folder,
-                'order': 'time',
-                'desc': 1,
-                'start': (self.current_page - 1) * self.page_size,
-                'limit': self.page_size
-            }
-            
-            # 调用百度网盘API
-            response = requests.get(
-                'https://pan.baidu.com/rest/2.0/xpan/file',
-                params=params
+            result = self.api_client.list_files(
+                dir_path=self.current_folder or "/", 
+                limit=self.page_size, 
+                page=self.current_page
             )
             
-            result = response.json()
-            if result.get('errno') == 0:
-                files = result.get('list', [])
+            if result and result.get("status") == "ok":
+                data = result.get("data", {})
+                files = data.get("list") or data.get("files") or []
                 
                 # 如果返回的文件数小于页大小，说明没有更多数据了
                 if len(files) < self.page_size:
@@ -3297,17 +3351,22 @@ class FileManagerUI(QMainWindow):
                 
                 # 添加新的文件到列表
                 if files:
-                    self.display_files(files, append=True)
+                    self.display_user_files(files, append=True)
                     if self.has_more:
                         self.status_label.setText(f"已加载第 {self.current_page} 页")
                 else:
                     self.has_more = False
                     self.status_label.setText("已加载全部文件")
             else:
-                self.status_label.setText(f"加载失败：错误码 {result.get('errno')}")
+                error_msg = result.get("error", "加载失败") if result else "网络连接失败"
+                self.status_label.setText(f"加载更多失败: {error_msg}")
+                # 回退页码
+                self.current_page -= 1
                 
         except Exception as e:
-            self.status_label.setText(f"加载失败：{str(e)}")
+            self.status_label.setText(f"加载更多失败: {str(e)}")
+            # 回退页码
+            self.current_page -= 1
         finally:
             self.is_loading = False
 
@@ -3360,13 +3419,9 @@ class FileManagerUI(QMainWindow):
             self.status_label.setText(f"准备下载 {len(download_queue)} 个文件...")
 
             # 创建批量下载线程
-            self.batch_download_worker = BatchDownloadWorker(
-                self.access_token,
-                download_queue
-            )
-            self.batch_download_worker.progress.connect(self.update_batch_download_progress)
-            self.batch_download_worker.finished.connect(self.batch_download_finished)
-            self.batch_download_worker.start()
+            # 暂时禁用批量下载功能（access_token已废弃）
+            QMessageBox.information(self, "提示", "批量下载功能暂时不可用")
+            return
 
         except Exception as e:
             self.status_label.setText(f"批量下载失败: {str(e)}")
@@ -3556,15 +3611,32 @@ class FileManagerUI(QMainWindow):
             
             # 添加每个文件项
             for file in files:
+                # 字段映射兜底逻辑
+                filename = (file.get("server_filename") or 
+                           file.get("file_name") or 
+                           file.get("filename") or 
+                           file.get("name") or "")
+                
+                file_size = (file.get("file_size") or 
+                            file.get("size") or 0)
+                
+                category = (file.get("category") or 
+                           file.get("category_id") or 
+                           file.get("type") or 0)
+                
+                fs_id = (file.get("fs_id") or 
+                        file.get("fsid") or 
+                        file.get("id") or "")
+                
                 # 创建名称列
-                name_item = QStandardItem(QIcon(get_icon_path(self.get_file_icon(file))), file.get("server_filename", ""))
+                name_item = QStandardItem(QIcon(get_icon_path(self.get_file_icon(file))), filename)
                 name_item.setData(file, Qt.UserRole)
                 
                 # 创建其他列
-                type_item = QStandardItem(self.map_category_to_type(file.get("category", 0)))
-                size_item = QStandardItem(self.format_size(file.get("size", 0)))
-                id_item = QStandardItem(str(file.get("fs_id", "")))
-                category_item = QStandardItem(str(file.get("category", 0)))
+                type_item = QStandardItem(self.map_category_to_type(category))
+                size_item = QStandardItem(self.format_size(file_size))
+                id_item = QStandardItem(str(fs_id))
+                category_item = QStandardItem(str(category))
                 
                 # 将这一行添加到模型中
                 self.model.appendRow([name_item, type_item, size_item, id_item, category_item])
@@ -3647,72 +3719,6 @@ class FileManagerUI(QMainWindow):
         """上传完成的处理"""
         pass
 
-    def check_scroll_position(self, value):
-        """检查滚动位置，到底时加载更多"""
-        scrollbar = self.file_tree.verticalScrollBar()
-        # 公共资源模式：到底自动加载下一页
-        if self.in_public:
-            if value == scrollbar.maximum() and not self.public_loading and self.public_has_more:
-                self.load_public_resources(load_more=True)
-            return
-        # 原有逻辑（网盘文件）
-        # 当滚动到底部且不在加载状态且还有更多数据时
-        if (value == scrollbar.maximum() and 
-            not self.is_loading and 
-            self.has_more):
-            self.load_more_files()
-        elif value == scrollbar.maximum() and not self.has_more:
-            # 当滚动到底部但没有更多数据时显示提示
-            self.status_label.setText("已加载全部文件")
-
-    def load_more_files(self):
-        """加载更多文件"""
-        self.is_loading = True
-        self.status_label.setText("正在加载更多文件...")
-        self.current_page += 1
-        
-        try:
-            # 构造请求参数
-            params = {
-                'method': 'list',
-                'access_token': self.access_token,
-                'dir': self.current_folder,
-                'order': 'time',
-                'desc': 1,
-                'start': (self.current_page - 1) * self.page_size,
-                'limit': self.page_size
-            }
-            
-            # 调用百度网盘API
-            response = requests.get(
-                'https://pan.baidu.com/rest/2.0/xpan/file',
-                params=params
-            )
-            
-            result = response.json()
-            if result.get('errno') == 0:
-                files = result.get('list', [])
-                
-                # 如果返回的文件数小于页大小，说明没有更多数据了
-                if len(files) < self.page_size:
-                    self.has_more = False
-                    self.status_label.setText("已加载全部文件")
-                
-                # 添加新的文件到列表
-                if files:
-                    self.display_files(files, append=True)
-                    if self.has_more:
-                        self.status_label.setText(f"已加载第 {self.current_page} 页")
-                else:
-                    self.has_more = False
-                    self.status_label.setText("已加载全部文件")
-            else:
-                self.status_label.setText(f"加载失败：错误码 {result.get('errno')}")
-                
-        except Exception as e:
-            self.status_label.setText(f"加载失败：{str(e)}")
-        finally:
-            self.is_loading = False
 
     def download_selected_files(self):
         """批量下载选择的文件"""
@@ -3763,13 +3769,9 @@ class FileManagerUI(QMainWindow):
             self.status_label.setText(f"准备下载 {len(download_queue)} 个文件...")
 
             # 创建批量下载线程
-            self.batch_download_worker = BatchDownloadWorker(
-                self.access_token,
-                download_queue
-            )
-            self.batch_download_worker.progress.connect(self.update_batch_download_progress)
-            self.batch_download_worker.finished.connect(self.batch_download_finished)
-            self.batch_download_worker.start()
+            # 暂时禁用批量下载功能（access_token已废弃）
+            QMessageBox.information(self, "提示", "批量下载功能暂时不可用")
+            return
 
         except Exception as e:
             self.status_label.setText(f"批量下载失败: {str(e)}")
@@ -3820,5 +3822,56 @@ class FileManagerUI(QMainWindow):
         """显示举报对话框"""
         QMessageBox.information(self, "举报", "举报功能已移除业务逻辑，仅保留界面。")
 
+    def load_more_user_search(self):
+        """加载更多用户态搜索结果"""
+        if not self.user_search_mode or not self.user_search_has_more:
+            return
+            
+        self.is_loading = True
+        self.status_label.setText("正在加载更多搜索结果...")
+        self.user_search_page += 1
+        
+        try:
+            # 调用搜索API
+            result = self.api_client.search_filename(
+                key=self.user_search_keyword, 
+                dir_path=self.user_search_dir, 
+                page=self.user_search_page, 
+                num=self.user_search_page_size, 
+                recursion=True
+            )
+            
+            # 兼容多种status格式
+            status = result.get("status", "").lower() if result else ""
+            if result and status in ["ok", "success"]:
+                data = result.get("data", {})
+                # 放宽结果解析，支持多种字段名
+                files = data.get("list") or data.get("files") or result.get("files") or []
+                
+                # 如果返回的文件数小于页大小，说明没有更多数据了
+                if len(files) < self.user_search_page_size:
+                    self.user_search_has_more = False
+                    self.status_label.setText("已加载全部搜索结果")
+                else:
+                    self.status_label.setText(f"找到 {len(files)} 个结果（第 {self.user_search_page} 页）")
+                
+                # 添加新的文件到列表
+                if files:
+                    self.display_user_files(files, append=True)
+                else:
+                    self.user_search_has_more = False
+                    self.status_label.setText("已加载全部搜索结果")
+            else:
+                error_msg = result.get("error", "搜索失败") if result else "网络连接失败"
+                self.status_label.setText(f"加载更多失败: {error_msg}")
+                # 回退页码
+                self.user_search_page -= 1
+                
+        except Exception as e:
+            self.status_label.setText(f"加载更多失败: {str(e)}")
+            # 回退页码
+            self.user_search_page -= 1
+        finally:
+            self.is_loading = False
 
 

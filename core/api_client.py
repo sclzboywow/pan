@@ -556,9 +556,9 @@ class APIClient(QObject):
                 self.save_accounts()
             self.save_tokens(None, None, self.user_info)
     
-    def list_files(self, dir_path: str = "/", limit: int = 100) -> Optional[Dict[str, Any]]:
+    def list_files(self, dir_path: str = "/", limit: int = 100, page: int = 1) -> Optional[Dict[str, Any]]:
         """获取文件列表"""
-        return self.call_api("list_files", {"dir": dir_path, "limit": limit})
+        return self.call_api("list_files", {"dir": dir_path, "limit": limit, "page": page})
     
     def list_images(self, dir_path: str = "/", limit: int = 100) -> Optional[Dict[str, Any]]:
         """获取图片列表"""
@@ -792,12 +792,30 @@ class APIClient(QObject):
             "remote_path": remote_path
         })
     
-    def search_filename(self, keyword: str, dir_path: str = "/") -> Optional[Dict[str, Any]]:
+    def search_filename(self, key: str, dir_path: str = "/", page: int = 1, num: int = 50, recursion: bool = True) -> Optional[Dict[str, Any]]:
         """按文件名搜索"""
-        return self.call_api("search_filename", {
-            "keyword": keyword,
-            "dir": dir_path
-        })
+        payload = {
+            "key": key,
+            "dir": dir_path,
+            "page": str(page),
+            "num": str(num),
+            "recursion": "1" if recursion else "0",
+            "keyword": key  # 兼容性：同时携带keyword以兼容老后端
+        }
+        
+        # 调试信息：打印请求参数
+        print(f"[DEBUG] search_filename payload: {payload}")
+        
+        result = self.call_api("search_filename", payload)
+        
+        # 调试信息：打印响应前300字符
+        if result:
+            result_str = str(result)[:300]
+            print(f"[DEBUG] search_filename response: {result_str}...")
+        else:
+            print("[DEBUG] search_filename response: None")
+            
+        return result
     
     def search_semantic(self, keyword: str, dir_path: str = "/") -> Optional[Dict[str, Any]]:
         """语义搜索"""
