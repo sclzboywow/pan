@@ -67,10 +67,18 @@ class UploadWorker(QThread):
             if self.is_public:
                 resp = self.api_client.public_upload_multipart(dir_path="/用户上传", local_path=p, filename=base_name, md5=md5_hex)
             else:
-                remote_path = (self.user_dir.rstrip('/') + '/' + base_name) if self.user_dir != '/' else '/' + base_name
-                resp = self.api_client.upload_local_file(p, remote_path)
+                # 用户态上传：使用user_upload_local
+                # 确保目录路径以/开头
+                user_dir = self.user_dir
+                if not user_dir.startswith('/'):
+                    user_dir = '/' + user_dir
+                remote_path = (user_dir.rstrip('/') + '/' + base_name) if user_dir != '/' else '/' + base_name
+                resp = self.api_client.user_upload_local_file(p, remote_path, md5=md5_hex)
+                # 调试输出
+                print(f"[DEBUG] 批量上传响应: {resp}")
 
-            ok = isinstance(resp, dict) and resp.get('status') == 'ok'
+            # 检查成功状态，包括duplicate
+            ok = isinstance(resp, dict) and (resp.get('status') == 'ok' or resp.get('status') == 'duplicate')
             try:
                 inner = (resp or {}).get('data') if isinstance(resp, dict) else None
                 if inner and isinstance(inner, dict) and str(inner.get('status') or 'ok').lower() == 'error':

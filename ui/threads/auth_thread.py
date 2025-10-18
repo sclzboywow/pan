@@ -28,7 +28,14 @@ class AuthThread(QThread):
         poll_interval = 5
         
         while self.running and attempts < max_attempts:
-            result = self.api_client.poll_auth_status(self.device_code)
+            try:
+                result = self.api_client.poll_auth_status(self.device_code)
+            except Exception as e:
+                print(f"轮询网络错误: {e}")
+                # 网络错误时继续轮询，不中断
+                self.msleep(poll_interval * 1000)
+                attempts += 1
+                continue
             
             if result:
                 if result.get("status") == "ok":
@@ -49,6 +56,7 @@ class AuthThread(QThread):
     def stop(self):
         """停止轮询"""
         self.running = False
+        self.requestInterruption()  # 请求中断，配合_safe_sleep使用
 
 
 class AutoAuthThread(QThread):
@@ -66,15 +74,23 @@ class AutoAuthThread(QThread):
     
     def run(self):
         """轮询授权状态"""
+        self.running = True  # 确保running状态正确初始化
         max_attempts = 120  # 10分钟
         attempts = 0
         poll_interval = 5  # 遵循设备授权最小间隔建议
         
-        while self.running and attempts < max_attempts:
-            result = self.api_client.poll_auto_auth_status(
-                self.device_code, 
-                self.api_client.device_fingerprint
-            )
+        while self.running and attempts < max_attempts and not self.isInterruptionRequested():
+            try:
+                result = self.api_client.poll_auto_auth_status(
+                    self.device_code, 
+                    self.api_client.device_fingerprint
+                )
+            except Exception as e:
+                print(f"轮询网络错误: {e}")
+                # 网络错误时继续轮询，不中断
+                self._safe_sleep(poll_interval * 1000)
+                attempts += 1
+                continue
             
             if result:
                 if (result.get("status") or "").lower() in ("success", "ok"):
@@ -85,12 +101,15 @@ class AutoAuthThread(QThread):
                         print("[AUTH SUCCESS]", result)
                     # 自动授权成功，设置JWT token
                     jwt_token = result.get("jwt_token")
+                    refresh_token = result.get("refresh_token")
                     baidu_token = result.get("baidu_token")
                     user_info = result.get("user_info")
                     
                     if jwt_token:
                         self.api_client.user_jwt = jwt_token
                         self.api_client.session.headers.update({'Authorization': f'Bearer {self.api_client.user_jwt}'})
+                    if refresh_token:
+                        self.api_client.refresh_token_value = refresh_token
                     if baidu_token:
                         self.api_client.baidu_token = baidu_token
                     if user_info:
@@ -99,6 +118,8 @@ class AutoAuthThread(QThread):
                         # 多账号保存与切换
                         uk = str(user_info.get('uk')) if user_info else None
                         if uk:
+                            # 先设置refresh_token，再保存账号
+                            self.api_client.refresh_token_value = refresh_token
                             self.api_client.save_account(uk, jwt_token, baidu_token, user_info)
                             self.api_client.set_current_account(uk)
                         # 兼容旧存储
@@ -126,12 +147,23 @@ class AutoAuthThread(QThread):
                     if attempts % 3 == 0:
                         self.status_update.emit("安全提示：二维码仅用于百度网盘授权，服务器不会保存任何个人信息。请在手机端扫码授权。")
             
-            self.msleep(poll_interval * 1000)
+            self._safe_sleep(poll_interval * 1000)
             attempts += 1
         
         if attempts >= max_attempts:
             self.auth_failed.emit("授权超时")
     
+    def _safe_sleep(self, milliseconds):
+        """安全的睡眠，支持中断请求"""
+        total_ms = milliseconds
+        step_ms = 100  # 每100ms检查一次中断请求
+        
+        while total_ms > 0 and not self.isInterruptionRequested() and self.running:
+            sleep_ms = min(step_ms, total_ms)
+            self.msleep(sleep_ms)
+            total_ms -= sleep_ms
+    
     def stop(self):
         """停止轮询"""
         self.running = False
+        self.requestInterruption()  # 请求中断，配合_safe_sleep使用

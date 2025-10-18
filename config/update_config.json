@@ -1,0 +1,10 @@
+{
+  "api_base_url": "http://118.24.67.10",
+  "current_version": "1.0.1",
+  "platform": "desktop",
+  "auto_check_enabled": true,
+  "auto_check_interval": 1800000,
+  "timeout": 10,
+  "retry_attempts": 3
+}
+
