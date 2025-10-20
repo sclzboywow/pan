@@ -556,9 +556,9 @@ class APIClient(QObject):
                 self.save_accounts()
             self.save_tokens(None, None, self.user_info)
     
-    def list_files(self, dir_path: str = "/", limit: int = 100) -> Optional[Dict[str, Any]]:
+    def list_files(self, dir_path: str = "/", limit: int = 100, page: int = 1) -> Optional[Dict[str, Any]]:
         """获取文件列表"""
-        return self.call_api("list_files", {"dir": dir_path, "limit": limit})
+        return self.call_api("list_files", {"dir": dir_path, "limit": limit, "page": page})
     
     def list_images(self, dir_path: str = "/", limit: int = 100) -> Optional[Dict[str, Any]]:
         """获取图片列表"""
@@ -626,16 +626,21 @@ class APIClient(QObject):
     def public_upload_url(self, url: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
         return self.call_public_api("upload_url", {"url": url, "dir": dir_path, "filename": filename})
 
-    def user_upload_text(self, content: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
-        """用户态文本上传"""
-        return self.call_api("upload_text", {"content": content, "dir": dir_path, "filename": filename})
+    def _calculate_file_md5(self, file_path: str) -> str:
+        """计算文件的MD5值"""
+        import hashlib
+        try:
+            hash_md5 = hashlib.md5()
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    hash_md5.update(chunk)
+            return hash_md5.hexdigest()
+        except Exception as e:
+            print(f"[DEBUG] MD5计算失败: {e}")
+            return None
 
-    def user_upload_local_file(self, local_path: str, remote_path: str, max_concurrent: int = 3) -> Optional[Dict[str, Any]]:
-        """用户态本地文件上传 - 使用POST /upload端点"""
-        # 验证路径限制：必须限制在/用户上传目录下
-        if not remote_path.startswith('/用户上传'):
-            return {"status": "error", "error": "upload_dir_not_allowed", "message": "用户态上传路径必须限制在/用户上传目录下"}
-        
+    def user_upload_local_file(self, local_path: str, remote_path: str, md5: str = None) -> Optional[Dict[str, Any]]:
+        """用户态本地文件上传 - 使用POST /upload/user接口"""
         try:
             if not self.user_jwt:
                 return {"status": "error", "error": "not_logged_in"}
@@ -648,7 +653,16 @@ class APIClient(QObject):
             if not filename:
                 return {"status": "error", "error": "invalid_filename"}
             
-            url = f"{self.base_url}/upload"
+            print(f"[DEBUG] 调用 user_upload_local_file，local_path: {local_path}, remote_path: {remote_path}")
+            
+            # 如果没有提供MD5，自动计算
+            if not md5:
+                md5 = self._calculate_file_md5(local_path)
+                if md5:
+                    print(f"[DEBUG] 自动计算MD5: {md5}")
+            
+            # 使用新的用户态上传接口
+            url = f"{self.base_url}/upload/user"
             with open(local_path, 'rb') as f:
                 files = {
                     'file': (filename, f, 'application/octet-stream')
@@ -657,18 +671,47 @@ class APIClient(QObject):
                     'dir': dir_path,
                     'filename': filename
                 }
+                # 可选：提供MD5用于去重
+                if md5:
+                    data['md5'] = md5
+                    print(f"[DEBUG] 提供MD5用于去重: {md5}")
+                
                 headers = {
                     'Authorization': f'Bearer {self.user_jwt}'
                 }
                 # 使用requests.post避免session headers Content-Type冲突
                 import requests
                 resp = requests.post(url, data=data, files=files, headers=headers)
+                print(f"[DEBUG] user_upload_local_file 响应状态码: {resp.status_code}")
                 if resp.status_code == 200:
-                    return resp.json()
+                    result = resp.json()
+                    print(f"[DEBUG] user_upload_local_file 响应: {result}")
+                    return result
                 else:
-                    return {"status": "error", "error": f"HTTP {resp.status_code}", "response": resp.text}
+                    error_result = {"status": "error", "error": f"HTTP {resp.status_code}", "response": resp.text}
+                    print(f"[DEBUG] user_upload_local_file 错误响应: {error_result}")
+                    return error_result
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            error_result = {"status": "error", "error": str(e)}
+            print(f"[DEBUG] user_upload_local_file 异常: {error_result}")
+            return error_result
+    
+    def user_upload_text(self, dir_path: str, filename: str, content: str) -> Optional[Dict[str, Any]]:
+        """用户态文本上传"""
+        print(f"[DEBUG] 调用 user_upload_text，dir: {dir_path}, filename: {filename}")
+        result = self.call_api("upload_text", {"dir": dir_path, "filename": filename, "content": content})
+        print(f"[DEBUG] user_upload_text 响应: {result}")
+        return result
+    
+    def user_upload_url(self, dir_path: str, url: str, filename: str = None) -> Optional[Dict[str, Any]]:
+        """用户态URL上传"""
+        params = {"dir": dir_path, "url": url}
+        if filename:
+            params["filename"] = filename
+        print(f"[DEBUG] 调用 user_upload_url，dir: {dir_path}, url: {url}, filename: {filename}")
+        result = self.call_api("upload_url", params)
+        print(f"[DEBUG] user_upload_url 响应: {result}")
+        return result
 
     def public_upload_text(self, content: str, dir_path: str, filename: str) -> Optional[Dict[str, Any]]:
         return self.call_public_api("upload_text", {"content": content, "dir": dir_path, "filename": filename})
@@ -749,12 +792,30 @@ class APIClient(QObject):
             "remote_path": remote_path
         })
     
-    def search_filename(self, keyword: str, dir_path: str = "/") -> Optional[Dict[str, Any]]:
+    def search_filename(self, key: str, dir_path: str = "/", page: int = 1, num: int = 50, recursion: bool = True) -> Optional[Dict[str, Any]]:
         """按文件名搜索"""
-        return self.call_api("search_filename", {
-            "keyword": keyword,
-            "dir": dir_path
-        })
+        payload = {
+            "key": key,
+            "dir": dir_path,
+            "page": str(page),
+            "num": str(num),
+            "recursion": "1" if recursion else "0",
+            "keyword": key  # 兼容性：同时携带keyword以兼容老后端
+        }
+        
+        # 调试信息：打印请求参数
+        print(f"[DEBUG] search_filename payload: {payload}")
+        
+        result = self.call_api("search_filename", payload)
+        
+        # 调试信息：打印响应前300字符
+        if result:
+            result_str = str(result)[:300]
+            print(f"[DEBUG] search_filename response: {result_str}...")
+        else:
+            print("[DEBUG] search_filename response: None")
+            
+        return result
     
     def search_semantic(self, keyword: str, dir_path: str = "/") -> Optional[Dict[str, Any]]:
         """语义搜索"""
@@ -798,6 +859,46 @@ class APIClient(QObject):
             "thumb": thumb,
             "extra": extra
         })
+    
+    def _fsid_to_path(self, fsid: str) -> Optional[str]:
+        """将fsid转换为路径（内部辅助方法）"""
+        try:
+            result = self.get_file_metas([fsid])
+            if result and result.get('errno') == 0:
+                data = result.get('data', {})
+                if data and 'list' in data and data['list']:
+                    return data['list'][0].get('path')
+        except Exception:
+            pass
+        return None
+    
+    def move_file_by_fsid(self, fsid: str, target_dir: str, new_name: str = None) -> Optional[Dict[str, Any]]:
+        """通过fsid移动文件（兼容性方法）"""
+        path = self._fsid_to_path(fsid)
+        if not path:
+            return {"errno": -9, "msg": "无法获取文件路径"}
+        return self.move_file(path, target_dir, new_name)
+    
+    def copy_file_by_fsid(self, fsid: str, target_dir: str) -> Optional[Dict[str, Any]]:
+        """通过fsid复制文件（兼容性方法）"""
+        path = self._fsid_to_path(fsid)
+        if not path:
+            return {"errno": -9, "msg": "无法获取文件路径"}
+        return self.copy_file(path, target_dir)
+    
+    def rename_file_by_fsid(self, fsid: str, new_name: str) -> Optional[Dict[str, Any]]:
+        """通过fsid重命名文件（兼容性方法）"""
+        path = self._fsid_to_path(fsid)
+        if not path:
+            return {"errno": -9, "msg": "无法获取文件路径"}
+        return self.rename_file(path, new_name)
+    
+    def delete_file_by_fsid(self, fsid: str) -> Optional[Dict[str, Any]]:
+        """通过fsid删除文件（兼容性方法）"""
+        path = self._fsid_to_path(fsid)
+        if not path:
+            return {"errno": -9, "msg": "无法获取文件路径"}
+        return self.delete_file(path)
     
     def _handle_api_error(self, response_data: Dict[str, Any]) -> str:
         """统一的API错误处理"""

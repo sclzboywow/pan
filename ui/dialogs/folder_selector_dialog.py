@@ -231,6 +231,9 @@ class FolderSelectorDialog(QDialog):
                 QMessageBox.warning(self, "提示", "不能选择当前目录作为目标")
                 return
             
+            # 更新当前文件夹状态
+            self.current_folder = selected_path
+            
             self.folder_selected.emit(selected_path)
             self.accept()
             
