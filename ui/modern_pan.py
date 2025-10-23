@@ -1140,21 +1140,37 @@ class FileManagerUI(QMainWindow):
             result = self.api_client.create_share_link(str(fsid), password if password else None, expire_days)
             
             if isinstance(result, dict) and result.get('status') in ('ok', 'success'):
-                share_url = result.get('share_url') or result.get('url') or result.get('link')
+                # 解析嵌套的响应结构
+                share_data = result.get('data', {}).get('data', {})
+                share_url = share_data.get('link') or result.get('share_url') or result.get('url') or result.get('link')
                 if share_url:
-                    # 复制到剪贴板
-                    from PySide6.QtWidgets import QApplication
-                    clipboard = QApplication.clipboard()
-                    clipboard.setText(share_url)
-                    
                     # 显示成功信息
                     from datetime import datetime, timedelta
                     expiry_date = datetime.now() + timedelta(days=expire_days)
                     expiry_str = expiry_date.strftime('%Y-%m-%d %H:%M')
                     
+                    # 获取实际的提取码（可能由服务器生成）
+                    actual_password = share_data.get('pwd', password)
+                    
+                    # 构建完整的分享信息文本
+                    share_info = f"文件分享信息\n"
+                    share_info += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    share_info += f"文件名：{filename}\n"
+                    share_info += f"分享链接：{share_url}\n"
+                    if actual_password:
+                        share_info += f"提取码：{actual_password}\n"
+                    share_info += f"有效期：{expiry_str}\n"
+                    share_info += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    
+                    # 复制完整信息到剪贴板
+                    from PySide6.QtWidgets import QApplication
+                    clipboard = QApplication.clipboard()
+                    clipboard.setText(share_info)
+                    
+                    # 显示成功信息
                     msg = f"分享链接已创建并复制到剪贴板：\n\n文件：{filename}\n链接：{share_url}"
-                    if password:
-                        msg += f"\n\n提取码：{password}"
+                    if actual_password:
+                        msg += f"\n\n提取码：{actual_password}"
                     msg += f"\n\n有效期截至：{expiry_str}"
                     QMessageBox.information(self, "分享成功", msg)
                     self.status_label.setText("分享链接已创建")
