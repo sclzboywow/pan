@@ -470,10 +470,26 @@ class APIClient(QObject):
                         return response.json()
                     else:
                         print(f"[DEBUG] 重试后仍然失败: HTTP {response.status_code}")
-            return None
+                        # 尝试解析错误信息
+                        try:
+                            error_data = response.json()
+                            error_msg = error_data.get('error') or error_data.get('message') or f"HTTP {response.status_code}"
+                        except:
+                            error_msg = f"HTTP {response.status_code}"
+                        raise Exception(error_msg)
+                else:
+                    raise Exception(f"Token刷新失败: HTTP {response.status_code}")
+            else:
+                # 其他HTTP错误状态码
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get('error') or error_data.get('message') or f"HTTP {response.status_code}"
+                except:
+                    error_msg = f"HTTP {response.status_code}"
+                raise Exception(error_msg)
         except Exception as e:
             print(f"API调用失败: {e}")
-            return None
+            raise e
     
     def call_public_api(self, operation: str, args: Dict[str, Any] = None) -> Optional[Dict[str, Any]]:
         """调用公共API（默认也携带JWT，以满足后端统一鉴权）"""
@@ -826,12 +842,34 @@ class APIClient(QObject):
     
     def create_share_link(self, fs_id: str, password: str = "", 
                          expire_days: int = 7) -> Optional[Dict[str, Any]]:
-        """创建分享链接"""
-        return self.call_api("share_create", {
-            "fs_id": fs_id,
-            "password": password,
-            "expire_days": expire_days
-        })
+        """创建分享链接（向后兼容接口）"""
+        # 转换为新接口格式
+        fsids = [str(fs_id)] if fs_id else []
+        return self.user_share_create(fsids, expire_days, password, "")
+    
+    def user_share_create(self, fsids: list, period: int = 7, pwd: str = "", remark: str = "") -> Optional[Dict[str, Any]]:
+        """创建用户态分享链接（新接口，与公共态对齐）"""
+        try:
+            # 确保fsids是字符串列表
+            fsids_arr = [str(x) for x in fsids]
+            
+            # 构建请求参数
+            args = {
+                'fsid_list': json.dumps(fsids_arr),  # JSON字符串格式
+                'period': int(period)
+            }
+            
+            if pwd:
+                args['pwd'] = str(pwd)
+            if remark:
+                args['remark'] = str(remark)
+            
+            # 调用API
+            return self.call_api('share_create', args)
+            
+        except Exception as e:
+            print(f"user_share_create失败: {e}")
+            return {"status": "error", "error": str(e)}
     
     def add_offline_download(self, url: str, save_path: str) -> Optional[Dict[str, Any]]:
         """添加离线下载任务"""
@@ -1170,7 +1208,10 @@ class APIClient(QObject):
         if expires_hint is not None:
             args['expires_hint'] = int(expires_hint)
         try:
-            return self.call_api('download_link', args)
+            result = self.call_api('download_link', args)
+            if result is None:
+                return {"status": "error", "error": "API调用失败"}
+            return result
         except Exception as e:
             print(f"user_download_link失败: {e}")
             return {"status": "error", "error": str(e)}
@@ -1267,3 +1308,319 @@ class APIClient(QObject):
             return data
         except Exception as e:
             return {"status": "error", "error": str(e)}
+
+    def get_user_baidu_token(self) -> Optional[Dict[str, Any]]:
+        """获取用户百度网盘token，用于直接调用百度网盘API"""
+        try:
+            if not self.is_logged_in():
+                return None
+            
+            # 如果本地已有token，直接返回
+            if self.baidu_token:
+                # 如果baidu_token是字符串，转换为字典格式
+                if isinstance(self.baidu_token, str):
+                    return {'access_token': self.baidu_token}
+                elif isinstance(self.baidu_token, dict) and self.baidu_token.get('access_token'):
+                    return self.baidu_token
+            
+            # 从后端获取用户百度token
+            payload = {"op": "get_user_baidu_token", "args": {}}
+            headers = {}
+            if self.user_jwt:
+                headers["Authorization"] = f"Bearer {self.user_jwt}"
+            
+            resp = self.session.post(f"{self.base_url}/mcp/user/exec", json=payload, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('status') == 'ok':
+                    baidu_token = data.get('data', {}).get('baidu_token')
+                    if baidu_token:
+                        # 确保baidu_token是字典格式
+                        if isinstance(baidu_token, str):
+                            try:
+                                import json
+                                baidu_token = json.loads(baidu_token)
+                            except:
+                                # 如果解析失败，构造一个简单的字典
+                                baidu_token = {'access_token': baidu_token}
+                        self.baidu_token = baidu_token
+                        return baidu_token
+            return None
+        except Exception as e:
+            print(f"[ERROR] 获取用户百度token失败: {e}")
+            return None
+
+    # ---------- 直链下载（遵循官方文档） ----------
+    def get_file_metas_with_dlink(self, fsids: List[Union[int, str]], access_token: str) -> Dict[str, Any]:
+        """使用 filemetas 接口获取文件元信息及 dlink。
+        
+        直接调用百度网盘API，使用POST方法。
+        """
+        import json as _json
+        import requests as _requests
+        import time
+
+        # 重试逻辑
+        max_retries = 3
+        retry_delay = 1
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"[DEBUG] filemetas 尝试 {attempt + 1}/{max_retries}")
+                print(f"[DEBUG] fsids原始: {fsids}")
+                
+                # 确保所有fsid都是整数类型
+                fsids_list = []
+                for x in fsids:
+                    if isinstance(x, str) and x.isdigit():
+                        fsids_list.append(int(x))
+                    elif isinstance(x, (int, float)):
+                        fsids_list.append(int(x))
+                    else:
+                        fsids_list.append(x)
+                
+                # 正确的API调用方式 - 使用GET请求
+                url = "https://pan.baidu.com/rest/2.0/xpan/multimedia"
+                params = {
+                    'method': 'filemetas',
+                    'fsids': _json.dumps(fsids_list),  # 确保是JSON字符串
+                    'dlink': 1,
+                    'access_token': access_token
+                }
+                
+                print(f"[DEBUG] 请求URL: {url}")
+                print(f"[DEBUG] 请求参数: {params}")
+                print(f"[DEBUG] fsids JSON: {params['fsids']}")
+                print(f"[DEBUG] access_token: {access_token[:20]}...")
+                
+                # 使用GET请求
+                response = _requests.get(url, params=params, timeout=30)
+                
+                # 打印完整的curl命令
+                curl_cmd = f"curl -X GET '{url}'"
+                for key, value in params.items():
+                    curl_cmd += f" -G -d '{key}={value}'"
+                print(f"[DEBUG] 完整curl命令:")
+                print(f"[DEBUG] {curl_cmd}")
+                
+                # 打印完整的请求URL
+                full_url = f"{url}?method={params['method']}&fsids={params['fsids']}&dlink={params['dlink']}&access_token={params['access_token']}"
+                print(f"[DEBUG] 完整请求URL:")
+                print(f"[DEBUG] {full_url}")
+                
+                # 打印响应头信息
+                print(f"[DEBUG] 响应状态码: {response.status_code}")
+                print(f"[DEBUG] 响应头信息:")
+                for header, value in response.headers.items():
+                    print(f"[DEBUG]   {header}: {value}")
+                
+                # 打印响应体信息
+                print(f"[DEBUG] 响应体长度: {len(response.content)} bytes")
+                print(f"[DEBUG] 响应体内容:")
+                try:
+                    response_json = response.json()
+                    print(f"[DEBUG] JSON格式: {response_json}")
+                except:
+                    print(f"[DEBUG] 原始文本: {response.text}")
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    
+                    if data.get('errno') == 0:
+                        return data
+                    else:
+                        errno = data.get('errno', "未知")
+                        errmsg = data.get('errmsg', "未知错误")
+                        print(f"[DEBUG] filemetas API错误: errno={errno}, errmsg={errmsg}")
+                        
+                        # 检查是否是可重试的错误
+                        if errno in [31296, 31297, 31298] and attempt < max_retries - 1:
+                            print(f"[DEBUG] 遇到API错误 {errno}，{retry_delay}秒后重试...")
+                            time.sleep(retry_delay)
+                            retry_delay *= 2
+                            continue
+                        
+                        raise RuntimeError(f"filemetas返回错误: errno={errno}, errmsg={errmsg}")
+                else:
+                    # 尝试解析错误
+                    try:
+                        err = response.json()
+                        print(f"[DEBUG] 错误响应: {err}")
+                    except Exception:
+                        err = {"errmsg": response.text, "http": response.status_code}
+                        print(f"[DEBUG] 错误文本: {response.text[:200]}")
+                    
+                    # 检查是否是可重试的错误
+                    if response.status_code == 500 and isinstance(err, dict):
+                        error_code = err.get('error_code', 0)
+                        if error_code in [31296, 31297, 31298]:  # 内部错误，可重试
+                            if attempt < max_retries - 1:
+                                print(f"[DEBUG] 遇到内部错误 {error_code}，{retry_delay}秒后重试...")
+                                time.sleep(retry_delay)
+                                retry_delay *= 2  # 指数退避
+                                continue
+                    
+                    raise RuntimeError(f"filemetas失败: HTTP {response.status_code} {err}")
+                
+            except Exception as e:
+                print(f"[DEBUG] filemetas 尝试 {attempt + 1} 失败: {e}")
+                if attempt == max_retries - 1:
+                    raise RuntimeError(f"获取文件信息失败: {e}")
+                else:
+                    print(f"[DEBUG] {retry_delay}秒后重试...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+
+    def download_via_dlink(self, dlink: str, access_token: str, save_path: str, range_start: Optional[int] = None, progress_callback=None) -> None:
+        """通过 dlink 进行直链下载，遵循官方要求：
+        - 必须在dlink URL中添加access_token参数
+        - 请求头设置完整的浏览器User-Agent
+        - 允许 302 跳转
+        - 支持 Range 断点续传（range_start 字节位置）
+        失败抛出异常。
+        """
+        import os as _os
+        import requests as _requests
+
+        # 确保保存目录存在
+        save_dir = _os.path.dirname(save_path)
+        if save_dir:
+            _os.makedirs(save_dir, exist_ok=True)
+
+        # 必须在dlink URL中添加access_token参数
+        url = dlink
+        
+        # 检查dlink是否包含access_token参数
+        if 'access_token=' not in url:
+            separator = '&' if '?' in url else '?'
+            url = f"{url}{separator}access_token={access_token}"
+            print(f"[DEBUG] 添加access_token参数到dlink: {url[:100]}...")
+        
+        # 精简请求头，仅保留必要字段
+        headers = {
+            # Use a realistic browser UA to avoid http_range validation quirks
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Referer": "https://pan.baidu.com/",
+        }
+        if range_start is not None and int(range_start) > 0:
+            headers["Range"] = f"bytes={int(range_start)}-"
+
+        print(f"[DEBUG] 开始下载文件: {url[:50]}...")
+        print(f"[DEBUG] 保存路径: {save_path}")
+        print(f"[DEBUG] 请求头: {headers}")
+
+        # 禁用代理，避免被系统代理影响
+        proxies = {"http": None, "https": None}
+        
+        # 创建新的session来避免cookie冲突
+        download_session = _requests.Session()
+        
+        # 添加必要的cookies（如果有的话）
+        if hasattr(self, 'session') and hasattr(self.session, 'cookies'):
+            download_session.cookies.update(self.session.cookies)
+
+        def _perform_request(hdrs):
+            return download_session.get(
+                url,
+                headers=hdrs,
+                stream=True,
+                allow_redirects=True,
+                timeout=60,
+                proxies=proxies,
+            )
+
+        r = _perform_request(headers)
+        # If server complains about http_range or returns 416/400, retry once without Range
+        if r.status_code in (400, 416) and ("Range" in headers):
+            try:
+                err_body = r.json() if r.content else {}
+            except Exception:
+                err_body = {}
+            if (
+                (isinstance(err_body, dict) and str(err_body.get("error_code")) == "31023")
+                or "http_range" in str(err_body)
+            ):
+                print("[DEBUG] 发现 http_range 错误，移除 Range 重试整文件下载")
+                headers.pop("Range", None)
+                r.close()
+                r = _perform_request(headers)
+
+        with r as r:
+            print(f"[DEBUG] 下载响应状态: {r.status_code}")
+            print(f"[DEBUG] 响应头: {dict(r.headers)}")
+            
+            if r.status_code == 403:
+                print(f"[DEBUG] 403错误响应内容: {r.text[:500]}")
+            
+            if r.status_code not in (200, 206):
+                # 常见错误：31045 token问题、31326 防盗链、31360 过期
+                try:
+                    err = r.json()
+                except Exception:
+                    err = {"errmsg": r.text[:500]}
+                raise RuntimeError(f"下载失败: HTTP {r.status_code} {err}")
+
+            total_size = int(r.headers.get('Content-Length') or 0)
+            mode = 'ab' if ("Range" in headers) else 'wb'
+            downloaded = int(range_start or 0)
+
+            with open(save_path, mode) as f:
+                for chunk in r.iter_content(chunk_size=512 * 1024):
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback and total_size > 0:
+                        try:
+                            pct = downloaded / (downloaded + (total_size - len(chunk)) if total_size else downloaded) * 100
+                        except Exception:
+                            pct = None
+                        if pct is not None:
+                            progress_callback(pct, downloaded, total_size)
+    
+    def download_file_direct(self, url: str, save_path: str, progress_callback=None) -> bool:
+        """直接下载文件（禁用代理）"""
+        try:
+            import os
+            import urllib.request
+            import urllib.parse
+            from urllib.error import URLError, HTTPError
+            
+            # 确保保存目录存在
+            save_dir = os.path.dirname(save_path)
+            if save_dir:  # 只有当路径包含目录时才创建目录
+                os.makedirs(save_dir, exist_ok=True)
+            
+            # 创建请求对象，禁用代理
+            request = urllib.request.Request(url)
+            request.add_header('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
+            
+            # 创建opener，禁用代理
+            opener = urllib.request.build_opener()
+            opener.addheaders = [('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')]
+            
+            # 开始下载
+            with opener.open(request) as response:
+                # 获取文件大小
+                total_size = int(response.headers.get('Content-Length', 0))
+                downloaded_size = 0
+                
+                with open(save_path, 'wb') as f:
+                    while True:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        
+                        # 调用进度回调
+                        if progress_callback and total_size > 0:
+                            progress = (downloaded_size / total_size) * 100
+                            progress_callback(progress, downloaded_size, total_size)
+            
+            print(f"[INFO] 文件下载完成: {save_path}")
+            return True
+            
+        except Exception as e:
+            print(f"[ERROR] 直接下载失败: {e}")
+            return False

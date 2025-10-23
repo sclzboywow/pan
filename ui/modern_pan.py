@@ -275,6 +275,56 @@ class ProxyDownloadWorker(QThread):
         except Exception as e:
             self.failed.emit(str(e))
 
+class DlinkDownloadWorker(QThread):
+    progress = Signal(float, int, int, float)  # percent, downloaded, total, speed_bps
+    status = Signal(str)
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, api_client, dlink: str, access_token: str, save_path: str, resume_pos: int = 0, parent=None):
+        super().__init__(parent)
+        self.api_client = api_client
+        self.dlink = dlink
+        self.access_token = access_token
+        self.save_path = save_path
+        self.resume_pos = int(resume_pos or 0)
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    def run(self):
+        try:
+            import time
+            last_time = time.time()
+            last_downloaded = self.resume_pos
+
+            def _cb(percent, downloaded, total):
+                nonlocal last_time, last_downloaded
+                if self._stopped:
+                    return
+                now = time.time()
+                elapsed = max(1e-3, now - last_time)
+                inc = max(0, int(downloaded) - int(last_downloaded))
+                speed = inc / elapsed
+                last_time = now
+                last_downloaded = int(downloaded)
+                self.progress.emit(float(percent or 0.0), int(downloaded), int(total), float(speed))
+
+            self.status.emit("下载中...")
+            self.api_client.download_via_dlink(
+                self.dlink,
+                self.access_token,
+                self.save_path,
+                range_start=self.resume_pos if self.resume_pos > 0 else None,
+                progress_callback=_cb,
+            )
+            if not self._stopped:
+                self.finished.emit(self.save_path)
+        except Exception as e:
+            if not self._stopped:
+                self.failed.emit(str(e))
+
 class FileManagerUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -921,7 +971,7 @@ class FileManagerUI(QMainWindow):
         try:
             if int(file_info.get('isdir') or 0) == 1:
                 return
-            # 改为后端签票 + 代理下载再打开
+            # 使用最新的直接下载方法
             import tempfile, os
             from PySide6.QtGui import QDesktopServices
             from PySide6.QtCore import QUrl
@@ -934,13 +984,14 @@ class FileManagerUI(QMainWindow):
                 print(f"[DEBUG][USER][OPEN] fsid={fsid}, path={path_val}")
             except Exception:
                 pass
-            self._proxy_download_to_path(fsid=fsid, path=path_val, save_path=tmp_path, ttl=300)
+            # 使用最新的直接下载方法
+            self._direct_download_to_path(fsid=fsid, path=path_val, save_path=tmp_path)
             QDesktopServices.openUrl(QUrl.fromLocalFile(tmp_path))
         except Exception as e:
             QMessageBox.warning(self, "打开", f"打开失败：{e}")
 
     def download_user_file(self, file_info: dict):
-        """用户态：下载到本地目录（简化为直链直接下载）。"""
+        """用户态：下载到本地目录（使用直接百度网盘API下载）。"""
         try:
             if int(file_info.get('isdir') or 0) == 1:
                 QMessageBox.information(self, "下载", "文件夹下载请在右键菜单中使用打包下载（待实现）。")
@@ -958,8 +1009,9 @@ class FileManagerUI(QMainWindow):
                 print(f"[DEBUG][USER][DL] fsid={fsid}, path={path_val}, save={save_path}")
             except Exception:
                 pass
-            self._proxy_download_to_path(fsid=fsid, path=path_val, save_path=save_path, ttl=600)
-            QMessageBox.information(self, "下载", f"已保存到：{save_path}")
+            
+            # 使用新的直接下载方法（异步，带进度）
+            self._direct_download_to_path(fsid=fsid, path=path_val, save_path=save_path)
         except Exception as e:
             QMessageBox.warning(self, "下载", f"下载失败：{e}")
 
@@ -1105,6 +1157,119 @@ class FileManagerUI(QMainWindow):
             # 其余错误直接抛出
             raise
 
+    def _direct_download_to_path(self, fsid=None, save_path: str = None, path: str = None):
+        """直接使用百度网盘API下载文件到本地路径（通过 filemetas 获取 dlink 并按规范下载）。"""
+        import os as _os
+        try:
+            # 1. 获取用户百度token
+            baidu_token = self.api_client.get_user_baidu_token()
+            if not baidu_token or not baidu_token.get('access_token'):
+                raise RuntimeError('无法获取用户百度token，请重新授权')
+            access_token = baidu_token.get('access_token')
+
+            # 2. 获取 dlink（优先使用 fsid 调用 filemetas）
+            if not fsid and not path:
+                raise RuntimeError('缺少fsid/path')
+
+            dlink = None
+            if fsid:
+                # 确保fsid是数字类型
+                try:
+                    fsid_int = int(fsid) if isinstance(fsid, str) else fsid
+                    meta = self.api_client.get_file_metas_with_dlink([fsid_int], access_token)
+                    meta_list = (meta.get('list') if isinstance(meta, dict) else None) or \
+                                ((meta.get('data') or {}).get('list') if isinstance(meta, dict) else None)
+                    if isinstance(meta_list, list) and meta_list:
+                        dlink = meta_list[0].get('dlink')
+                    else:
+                        pass
+                except Exception as e:
+                    # 继续尝试其他方法
+                    pass
+
+            if not dlink and path:
+                # 兜底：若只有路径，尝试后端已有能力获取直链
+                alt = self.api_client.user_download_link(path=path, expires_hint=300)
+                if isinstance(alt, dict):
+                    dlink = (alt.get('data') or {}).get('dlink') or alt.get('dlink')
+
+            if not dlink:
+                raise RuntimeError('无法获取dlink')
+
+            # 3. 断点续传位置
+            resume_from = None
+            if save_path and _os.path.exists(save_path):
+                size = _os.path.getsize(save_path)
+                if size > 0:
+                    resume_from = size
+
+            # 4. 异步直链下载（带进度/速率）
+            self.status_label.setText("下载中...")
+            self.progress_bar.value = 0
+            self.progress_bar.show()
+
+            self.user_download_worker = DlinkDownloadWorker(
+                api_client=self.api_client,
+                dlink=dlink,
+                access_token=access_token,
+                save_path=save_path,
+                resume_pos=resume_from or 0,
+                parent=self,
+            )
+
+            def _fmt_speed(bps: float) -> str:
+                units = ["B/s", "KB/s", "MB/s", "GB/s"]
+                v = float(bps or 0.0)
+                idx = 0
+                while v >= 1024 and idx < len(units) - 1:
+                    v /= 1024.0
+                    idx += 1
+                return f"{v:.1f} {units[idx]}"
+
+            def _on_progress(percent, downloaded, total, speed):
+                self.progress_bar.value = int(percent)
+                if total > 0:
+                    self.status_label.setText(f"下载中... {percent:.1f}% 速度 {_fmt_speed(speed)}")
+                else:
+                    self.status_label.setText(f"下载中... 速度 {_fmt_speed(speed)}")
+
+            def _on_status(s):
+                self.status_label.setText(s)
+
+            def _on_finished(path_done):
+                self.progress_bar.hide()
+                self.status_label.setText("下载完成")
+                QMessageBox.information(self, "下载", f"已保存到：{path_done}")
+
+            def _on_failed(err):
+                self.progress_bar.hide()
+                self.status_label.setText("下载失败")
+                QMessageBox.warning(self, "下载", f"下载失败：{err}")
+
+            self.user_download_worker.progress.connect(_on_progress)
+            self.user_download_worker.status.connect(_on_status)
+            self.user_download_worker.finished.connect(_on_finished)
+            self.user_download_worker.failed.connect(_on_failed)
+            self.user_download_worker.start()
+        except Exception as e:
+            raise RuntimeError(f"直接下载失败: {e}")
+    
+    def _get_baidu_download_url(self, fsid, access_token: str) -> str:
+        """兼容函数：改为通过 filemetas 获取 dlink。"""
+        meta = self.api_client.get_file_metas_with_dlink([str(fsid)], access_token)
+        meta_list = (meta.get('list') if isinstance(meta, dict) else None) or \
+                    ((meta.get('data') or {}).get('list') if isinstance(meta, dict) else None)
+        if isinstance(meta_list, list) and meta_list and meta_list[0].get('dlink'):
+            return meta_list[0]['dlink']
+        raise RuntimeError('无法获取dlink')
+    
+    def _download_file_from_url(self, download_url: str, save_path: str):
+        """向后兼容：通过 download_via_dlink 使用正确 UA/跳转/Range 下载。"""
+        bt = self.api_client.get_user_baidu_token()
+        if not bt or not bt.get('access_token'):
+            raise RuntimeError('无法获取用户百度token')
+        self.api_client.download_via_dlink(download_url, bt['access_token'], save_path)
+
     def share_user_file(self, file_info: dict, row: int = None):
         """用户态：分享文件，创建分享链接"""
         try:
@@ -1140,21 +1305,37 @@ class FileManagerUI(QMainWindow):
             result = self.api_client.create_share_link(str(fsid), password if password else None, expire_days)
             
             if isinstance(result, dict) and result.get('status') in ('ok', 'success'):
-                share_url = result.get('share_url') or result.get('url') or result.get('link')
+                # 解析嵌套的响应结构
+                share_data = result.get('data', {}).get('data', {})
+                share_url = share_data.get('link') or result.get('share_url') or result.get('url') or result.get('link')
                 if share_url:
-                    # 复制到剪贴板
-                    from PySide6.QtWidgets import QApplication
-                    clipboard = QApplication.clipboard()
-                    clipboard.setText(share_url)
-                    
                     # 显示成功信息
                     from datetime import datetime, timedelta
                     expiry_date = datetime.now() + timedelta(days=expire_days)
                     expiry_str = expiry_date.strftime('%Y-%m-%d %H:%M')
                     
+                    # 获取实际的提取码（可能由服务器生成）
+                    actual_password = share_data.get('pwd', password)
+                    
+                    # 构建完整的分享信息文本
+                    share_info = f"文件分享信息\n"
+                    share_info += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    share_info += f"文件名：{filename}\n"
+                    share_info += f"分享链接：{share_url}\n"
+                    if actual_password:
+                        share_info += f"提取码：{actual_password}\n"
+                    share_info += f"有效期：{expiry_str}\n"
+                    share_info += f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    
+                    # 复制完整信息到剪贴板
+                    from PySide6.QtWidgets import QApplication
+                    clipboard = QApplication.clipboard()
+                    clipboard.setText(share_info)
+                    
+                    # 显示成功信息
                     msg = f"分享链接已创建并复制到剪贴板：\n\n文件：{filename}\n链接：{share_url}"
-                    if password:
-                        msg += f"\n\n提取码：{password}"
+                    if actual_password:
+                        msg += f"\n\n提取码：{actual_password}"
                     msg += f"\n\n有效期截至：{expiry_str}"
                     QMessageBox.information(self, "分享成功", msg)
                     self.status_label.setText("分享链接已创建")
@@ -3718,109 +3899,6 @@ class FileManagerUI(QMainWindow):
     def upload_finished(self, success, message, failed_files):
         """上传完成的处理"""
         pass
-
-
-    def download_selected_files(self):
-        """批量下载选择的文件"""
-        if not self.is_vip:
-            QMessageBox.warning(self, "提示", "批量下载功能仅对VIP用户开放")
-            return
-
-        # 检查是否有正在进行的下载任务
-        if (self.download_worker and self.download_worker.isRunning()) or \
-           (hasattr(self, 'batch_download_worker') and self.batch_download_worker and self.batch_download_worker.isRunning()):
-            QMessageBox.warning(self, "提示", "有正在进行的下载任务，请等待当前下载完成。")
-            return
-
-        # 获取所有选中的项目
-        selected_indexes = self.file_tree.selectionModel().selectedRows()
-        if not selected_indexes:
-            QMessageBox.warning(self, "提示", "请先选择要下载的文件")
-            return
-
-        # 获取保存目录
-        save_dir = QFileDialog.getExistingDirectory(
-            self,
-            "选择保存目录",
-            "",
-            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
-        )
-
-        if not save_dir:
-            return
-
-        try:
-            # 创建下载队列
-            download_queue = []
-            for index in selected_indexes:
-                file_info = self.model.item(index.row(), 0).data(Qt.UserRole)
-                if file_info:
-                    fs_id = file_info.get('fs_id')
-                    file_name = file_info.get('server_filename')
-                    if fs_id:
-                        save_path = os.path.join(save_dir, file_name)
-                        download_queue.append((fs_id, save_path, file_name))
-
-            if not download_queue:
-                return
-
-            # 显示进度条
-            self.progress_bar.show()
-            self.status_label.setText(f"准备下载 {len(download_queue)} 个文件...")
-
-            # 创建批量下载线程
-            # 暂时禁用批量下载功能（access_token已废弃）
-            QMessageBox.information(self, "提示", "批量下载功能暂时不可用")
-            return
-
-        except Exception as e:
-            self.status_label.setText(f"批量下载失败: {str(e)}")
-            self.progress_bar.hide()
-
-    def update_batch_download_progress(self, current, total, file_name):
-        """更新批量下载进度"""
-        pass
-
-    def batch_download_finished(self):
-        """批量下载完成"""
-        pass
-
-    def pay_once_download(self, file_info):
-        """单次付费下载"""
-        QMessageBox.information(self, "付费下载", "付费下载功能已移除业务逻辑，仅保留界面。")
-
-    def start_actual_download(self, file_info):
-        """实际开始下载文件（付费下载后调用）"""
-        QMessageBox.information(self, "下载", "下载功能已移除业务逻辑，仅保留界面。")
-
-    def check_vip_status(self):
-        """检查用户VIP状态（本地）"""
-        pass
-        
-    def set_vip_status(self, is_vip: bool):
-        """设置用户VIP状态（本地）"""
-        self.is_vip = is_vip
-        # 更新文件树的选择模式
-        if is_vip:
-            self.file_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        else:
-            self.file_tree.setSelectionMode(QAbstractItemView.SingleSelection)
-
-    def start_download(self, file_info):
-        """开始下载文件"""
-        QMessageBox.information(self, "下载", "下载功能已移除业务逻辑，仅保留界面。")
-
-    def on_download_finished(self, success, file_name):
-        """处理下载完成的逻辑"""
-        QMessageBox.information(self, "下载完成", "下载功能已移除业务逻辑，仅保留界面。")
-
-    def share_file(self, file_info):
-        """分享文件信息"""
-        QMessageBox.information(self, "分享", "分享功能已移除业务逻辑，仅保留界面。")
-
-    def show_report_dialog(self, file_info):
-        """显示举报对话框"""
-        QMessageBox.information(self, "举报", "举报功能已移除业务逻辑，仅保留界面。")
 
     def load_more_user_search(self):
         """加载更多用户态搜索结果"""
