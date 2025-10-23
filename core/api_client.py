@@ -826,12 +826,34 @@ class APIClient(QObject):
     
     def create_share_link(self, fs_id: str, password: str = "", 
                          expire_days: int = 7) -> Optional[Dict[str, Any]]:
-        """创建分享链接"""
-        return self.call_api("share_create", {
-            "fs_id": fs_id,
-            "password": password,
-            "expire_days": expire_days
-        })
+        """创建分享链接（向后兼容接口）"""
+        # 转换为新接口格式
+        fsids = [str(fs_id)] if fs_id else []
+        return self.user_share_create(fsids, expire_days, password, "")
+    
+    def user_share_create(self, fsids: list, period: int = 7, pwd: str = "", remark: str = "") -> Optional[Dict[str, Any]]:
+        """创建用户态分享链接（新接口，与公共态对齐）"""
+        try:
+            # 确保fsids是字符串列表
+            fsids_arr = [str(x) for x in fsids]
+            
+            # 构建请求参数
+            args = {
+                'fsid_list': json.dumps(fsids_arr),  # JSON字符串格式
+                'period': int(period)
+            }
+            
+            if pwd:
+                args['pwd'] = str(pwd)
+            if remark:
+                args['remark'] = str(remark)
+            
+            # 调用API
+            return self.call_api('share_create', args)
+            
+        except Exception as e:
+            print(f"user_share_create失败: {e}")
+            return {"status": "error", "error": str(e)}
     
     def add_offline_download(self, url: str, save_path: str) -> Optional[Dict[str, Any]]:
         """添加离线下载任务"""
